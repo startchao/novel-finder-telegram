@@ -1,33 +1,31 @@
 """
-scraper.py — 69書吧 (69shuba.cx) 爬蟲模組
-包含反爬機制：隨機 UA、sleep 延遲、retry 指數退避
+scraper.py — 多站點輪流爬取模組
+使用 cloudscraper 繞過 Cloudflare / WAF，支援 4 個站台自動備援。
+
+站台優先順序：
+  1. 69書吧      (www.69shuba.cx / .com)
+  2. 飄天文學    (www.ptwxz.com)
+  3. 新笔趣阁    (www.xbiquge.so)
+  4. 台灣小說王  (twkan.com)
 """
 
 import re
 import time
 import random
 import logging
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urlparse, urljoin
 
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# 主域名，會在 warm-up 時依重定向自動更新
-BASE_URL = "https://www.69shuba.cx"
-_effective_base: str = BASE_URL  # 追蹤實際域名（可能被重定向到 .com）
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.6099.119 Mobile/15E148 Safari/604.1",
-]
-
-CATEGORY_MAP = {
+# ---------------------------------------------------------------------------
+# 共用分類對照表（用於 bot.py 顯示支援清單）
+# ---------------------------------------------------------------------------
+CATEGORY_MAP: dict[str, str] = {
     "玄幻": "xuanhuan",
     "仙侠": "xianxia",
     "仙俠": "xianxia",
@@ -39,83 +37,165 @@ CATEGORY_MAP = {
     "懸疑": "xuanyi",
 }
 
-# Patterns to skip when cleaning chapter content
+# ---------------------------------------------------------------------------
+# 站台設定
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SiteConfig:
+    name: str
+    base_url: str
+    hot_paths: list[str]           # 熱門榜 URL 路徑（依序嘗試）
+    hot_cat_tpl: str               # 分類榜模板，{cat} 替換為英文分類
+    category_map: dict[str, str]   # 此站台的分類對照
+    hot_item_sels: list[str]       # 熱門榜 li 選擇器（依序嘗試）
+    search_path: str               # 搜尋路徑
+    search_method: str             # GET 或 POST
+    search_param: str              # 搜尋關鍵字的 param 名
+    search_item_sels: list[str]    # 搜尋結果 li 選擇器
+    search_title_sels: list[str]   # 書名連結選擇器
+    search_author_sels: list[str]  # 作者選擇器
+    search_latest_sels: list[str]  # 最新章節選擇器
+    chapter_list_sels: list[str]   # 章節列表 a 選擇器
+    content_sels: list[str]        # 章節內文容器選擇器
+    encoding: str = "utf-8"
+
+
+SITE_69SHUBA = SiteConfig(
+    name="69書吧",
+    base_url="https://www.69shuba.cx",
+    hot_paths=["/top/allvisit/", "/top/allvisit.htm", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "#topbooks li", "ol li"],
+    search_path="/search.php",
+    search_method="POST",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "#searchmain li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "h4 a", "dt a"],
+    search_author_sels=[".author", ".writer", "span.author"],
+    search_latest_sels=[".update a", ".latest a", ".newchapter a"],
+    chapter_list_sels=["#chapters a", "#chapterlist a", ".chapterlist a", "#list a", ".listmain a"],
+    content_sels=["#content", ".content", "#chaptercontent", "#booktxt", "#txtnav"],
+    encoding="gb18030",
+)
+
+SITE_PTWXZ = SiteConfig(
+    name="飄天文學",
+    base_url="https://www.ptwxz.com",
+    hot_paths=["/top/allvisit/", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "ol li", "ul.list li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "dt a", "a"],
+    search_author_sels=[".author", "span.author"],
+    search_latest_sels=[".update a", ".newchapter a"],
+    chapter_list_sels=["#list a", "#chapters a", ".chapterlist a", ".listmain a"],
+    content_sels=["#content", ".content", "#chaptercontent"],
+    encoding="gb18030",
+)
+
+SITE_XBIQUGE = SiteConfig(
+    name="新笔趣阁",
+    base_url="https://www.xbiquge.so",
+    hot_paths=["/top/allvisit/", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "ol li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "dt a", "a"],
+    search_author_sels=[".author", "span.author"],
+    search_latest_sels=[".update a", ".newchapter a"],
+    chapter_list_sels=["#list a", "#chapters a", ".chapterlist a"],
+    content_sels=["#content", ".content", "#chaptercontent"],
+    encoding="utf-8",
+)
+
+SITE_TWKAN = SiteConfig(
+    name="台灣小說王",
+    base_url="https://twkan.com",
+    hot_paths=["/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map={"玄幻": "xuanhuan", "都市": "dushi"},
+    hot_item_sels=[".topbooks li", ".rank-list li", "ul li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul li"],
+    search_title_sels=["h3 a", ".bookname a", "a"],
+    search_author_sels=[".author"],
+    search_latest_sels=[".update a"],
+    chapter_list_sels=["#list a", "#chapters a"],
+    content_sels=["#txtcontent", "#content", ".content"],
+    encoding="utf-8",
+)
+
+# 站台優先順序
+SITES: list[SiteConfig] = [SITE_69SHUBA, SITE_PTWXZ, SITE_XBIQUGE, SITE_TWKAN]
+
+# ---------------------------------------------------------------------------
+# 內文清洗 pattern
+# ---------------------------------------------------------------------------
 _SKIP_RE = re.compile(
-    r"69.*?shuba|www\.|http[s]?://|上一[章節頁]|下一[章節頁]|"
-    r"返回書目|返回目錄|章節目錄|本章完|請記住.*?地址|"
-    r"最新網址|手機版|加入書架|推薦閱讀|笔趣阁|筆趣閣|"
+    r"69.*?shuba|ptwxz|xbiquge|twkan|www\.|http[s]?://|"
+    r"上一[章節頁]|下一[章節頁]|返回書目|返回目錄|章節目錄|本章完|"
+    r"請記住.*?地址|最新網址|手機版|加入書架|推薦閱讀|笔趣阁|筆趣閣|"
     r"第\s*\d+\s*頁\s*/\s*\d+|分享到",
     re.IGNORECASE,
 )
 
+# NAV items to skip when scanning <li> for titles
+_NAV_TITLES = {
+    "首頁", "首页", "排行", "書架", "书架", "登入", "登录",
+    "注冊", "注册", "搜索", "搜尋", "分類", "分类",
+}
 
 # ---------------------------------------------------------------------------
-# Session helpers
+# Session / HTTP helpers
 # ---------------------------------------------------------------------------
 
-def make_session() -> requests.Session:
-    """建立帶有隨機 UA 的 requests.Session（模擬 Chrome 瀏覽器完整標頭）"""
-    session = requests.Session()
-    _rotate_ua(session)
-    session.headers.update(
+def make_session() -> cloudscraper.CloudScraper:
+    """
+    建立 CloudScraper session（cloudscraper 是 requests.Session 子類別）。
+    使用 nodejs 解析器（GitHub Actions 內建 Node.js）。
+    """
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+            interpreter="nodejs",
+        )
+    except Exception:
+        # nodejs 不可用時 fallback 到預設解析器
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+        )
+    scraper.headers.update(
         {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
         }
     )
-    return session
-
-
-def _warm_up_session(session: requests.Session) -> str:
-    """
-    先訪問首頁取得 Cookie 與正確 domain（.cx 可能重定向到 .com）。
-    返回實際生效的 base URL（例如 https://www.69shuba.com）。
-    """
-    global _effective_base
-    for domain in (BASE_URL, "https://www.69shuba.com", "https://69shuba.com"):
-        try:
-            _rotate_ua(session)
-            session.headers["Sec-Fetch-Site"] = "none"
-            resp = session.get(domain + "/", timeout=20, allow_redirects=True)
-            if resp.status_code == 200:
-                from urllib.parse import urlparse
-                parsed = urlparse(resp.url)
-                _effective_base = f"{parsed.scheme}://{parsed.netloc}"
-                session.headers["Referer"] = _effective_base + "/"
-                session.headers["Sec-Fetch-Site"] = "same-origin"
-                logger.info("Session warm-up OK: effective base = %s", _effective_base)
-                _sleep()
-                return _effective_base
-            logger.warning("Warm-up %s returned %s", domain, resp.status_code)
-        except Exception as exc:
-            logger.warning("Warm-up failed for %s: %s", domain, exc)
-    logger.warning("All warm-up attempts failed, using default: %s", BASE_URL)
-    return BASE_URL
-
-
-def _rotate_ua(session: requests.Session) -> None:
-    session.headers["User-Agent"] = random.choice(USER_AGENTS)
+    return scraper
 
 
 def _sleep() -> None:
-    """每次請求後隨機 sleep 1~3 秒"""
     time.sleep(random.uniform(1.0, 3.0))
 
 
-def _decode(resp: requests.Response) -> str:
-    """自動偵測編碼（常見中文站使用 GB18030）"""
-    enc = resp.encoding or ""
-    if enc.lower() in ("gb2312", "gbk", "gb18030"):
+def _decode(resp) -> str:
+    """自動偵測 GB18030 / UTF-8 編碼"""
+    enc = (resp.encoding or "").lower()
+    if enc in ("gb2312", "gbk", "gb18030"):
         return resp.content.decode("gb18030", errors="replace")
-    # Try apparent encoding
     apparent = resp.apparent_encoding or "utf-8"
     try:
         return resp.content.decode(apparent, errors="replace")
@@ -123,285 +203,285 @@ def _decode(resp: requests.Response) -> str:
         return resp.content.decode("utf-8", errors="replace")
 
 
-def fetch(
-    session: requests.Session,
-    url: str,
-    method: str = "GET",
-    max_retries: int = 3,
-    **kwargs,
-) -> requests.Response:
-    """帶 retry + 指數退避的 fetch，每次輪換 UA"""
+def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 3, **kwargs):
+    """帶 retry + 指數退避的請求"""
     last_exc: Exception = RuntimeError(f"Failed: {url}")
     for attempt in range(max_retries):
         try:
-            _rotate_ua(session)
             if method.upper() == "POST":
-                resp = session.post(url, timeout=30, **kwargs)
+                resp = scraper.post(url, timeout=30, **kwargs)
             else:
-                resp = session.get(url, timeout=30, **kwargs)
+                resp = scraper.get(url, timeout=30, **kwargs)
             resp.raise_for_status()
             _sleep()
             return resp
-        except requests.HTTPError as exc:
-            last_exc = exc
-            if exc.response is not None and exc.response.status_code == 404:
-                raise
-            wait = 2 ** attempt
-            logger.warning("HTTP %s on attempt %d for %s — waiting %ds", exc.response.status_code if exc.response else "?", attempt + 1, url, wait)
         except Exception as exc:
             last_exc = exc
+            if hasattr(exc, "response") and exc.response is not None:
+                if exc.response.status_code == 404:
+                    raise
             wait = 2 ** attempt
-            logger.warning("Error on attempt %d for %s: %s — waiting %ds", attempt + 1, url, exc, wait)
-        if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)
+            logger.warning("Attempt %d/%d failed for %s: %s (wait %ds)",
+                           attempt + 1, max_retries, url, exc, wait)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
     raise last_exc
+
+
+def _warm_up(scraper, site: SiteConfig) -> str:
+    """
+    先訪問首頁取得 Cookie，返回實際 base URL（跟蹤重定向）。
+    """
+    for url in (site.base_url, site.base_url.replace(".cx", ".com")):
+        try:
+            resp = scraper.get(url + "/", timeout=20, allow_redirects=True)
+            if resp.status_code == 200:
+                parsed = urlparse(resp.url)
+                base = f"{parsed.scheme}://{parsed.netloc}"
+                scraper.headers["Referer"] = base + "/"
+                logger.info("[%s] warm-up OK → %s", site.name, base)
+                _sleep()
+                return base
+        except Exception as exc:
+            logger.warning("[%s] warm-up failed (%s): %s", site.name, url, exc)
+    return site.base_url
 
 
 # ---------------------------------------------------------------------------
 # Hot list
 # ---------------------------------------------------------------------------
 
-def get_hot_list(category: str | None = None) -> list[dict]:
-    """返回 Top 20 熱門小說（含排名、書名、URL）"""
-    session = make_session()
-    base = _warm_up_session(session)  # 先取得 Cookie + 正確 domain
-
-    if category and category in CATEGORY_MAP:
-        cat_key = CATEGORY_MAP[category]
-        candidate_urls = [
-            f"{base}/top/{cat_key}/",
-            f"{base}/top/{cat_key}.htm",
-            f"{base}/top/",
-        ]
-    else:
-        candidate_urls = [
-            f"{base}/top/allvisit/",
-            f"{base}/top/allvisit.htm",
-            f"{base}/top/",
-            f"{base}/",           # 首頁通常也有熱門榜
-        ]
-
-    resp = None
-    url = candidate_urls[0]
-    for candidate in candidate_urls:
-        try:
-            logger.info("Trying hot list URL: %s", candidate)
-            session.headers["Referer"] = base + "/"
-            resp = fetch(session, candidate)
-            url = candidate
-            break
-        except Exception as exc:
-            logger.warning("Hot list URL %s failed: %s", candidate, exc)
-
-    if resp is None:
-        raise RuntimeError("所有熱門榜 URL 均無法訪問，請稍後再試。")
-
-    logger.info("Fetching hot list: %s", url)
-    html = _decode(resp)
-    soup = BeautifulSoup(html, "lxml")
-
+def _parse_hot(soup: BeautifulSoup, site: SiteConfig, base: str) -> list[dict]:
+    """從已解析的 soup 中提取熱門小說清單"""
     novels: list[dict] = []
 
-    # Try progressively broader selectors
-    for sel in (
-        "ul.topbooks li",
-        ".rank-books li",
-        ".top-list li",
-        "#topbooks li",
-        "ol li",
-        ".booklist li",
-    ):
+    for sel in site.hot_item_sels:
         items = soup.select(sel)
-        if items:
-            logger.info("Hot list selector '%s' → %d items", sel, len(items))
-            for item in items:
-                link = item.select_one("a")
-                if not link:
-                    continue
-                title = link.get_text(strip=True)
-                if len(title) < 2 or title in {"首頁", "排行", "書架", "登入", "注冊", "登录", "注册"}:
-                    continue
-                novels.append(
-                    {
-                        "rank": len(novels) + 1,
-                        "title": title,
-                        "url": link.get("href", ""),
-                    }
-                )
-                if len(novels) >= 20:
-                    break
-            if novels:
-                break
-
-    if not novels:
-        logger.warning("Fallback: scanning all <li> elements")
-        for item in soup.find_all("li"):
+        if not items:
+            continue
+        logger.info("[%s] hot selector '%s' → %d items", site.name, sel, len(items))
+        for item in items:
             link = item.select_one("a")
             if not link:
                 continue
             title = link.get_text(strip=True)
-            if len(title) < 2 or title in {"首頁", "排行", "書架", "登入"}:
+            if len(title) < 2 or title in _NAV_TITLES:
                 continue
-            # Heuristic: novel titles are usually 2-20 chars
-            if 2 <= len(title) <= 20:
-                novels.append(
-                    {
-                        "rank": len(novels) + 1,
-                        "title": title,
-                        "url": link.get("href", ""),
-                    }
-                )
-                if len(novels) >= 20:
-                    break
+            href = link.get("href", "")
+            full_url = href if href.startswith("http") else urljoin(base, href)
+            novels.append({"rank": len(novels) + 1, "title": title, "url": full_url})
+            if len(novels) >= 20:
+                break
+        if novels:
+            break
 
-    logger.info("Hot list: found %d novels", len(novels))
     return novels
+
+
+def _hot_from_site(site: SiteConfig, category: Optional[str]) -> list[dict]:
+    scraper = make_session()
+    base = _warm_up(scraper, site)
+    scraper.headers["Referer"] = base + "/"
+
+    if category and category in site.category_map:
+        cat_key = site.category_map[category]
+        paths = [site.hot_cat_tpl.format(cat=cat_key)] + site.hot_paths
+    else:
+        paths = site.hot_paths
+
+    for path in paths:
+        url = base + path
+        try:
+            logger.info("[%s] trying hot URL: %s", site.name, url)
+            resp = _fetch(scraper, url)
+            html = _decode(resp)
+            soup = BeautifulSoup(html, "lxml")
+            novels = _parse_hot(soup, site, base)
+            if novels:
+                logger.info("[%s] hot list: %d novels from %s", site.name, len(novels), url)
+                return novels
+        except Exception as exc:
+            logger.warning("[%s] hot URL %s failed: %s", site.name, url, exc)
+
+    return []
+
+
+def get_hot_list(category: Optional[str] = None) -> list[dict]:
+    """輪流嘗試各站台，返回 Top 20 熱門小說"""
+    errors: list[str] = []
+    for site in SITES:
+        try:
+            novels = _hot_from_site(site, category)
+            if novels:
+                return novels
+        except Exception as exc:
+            errors.append(f"{site.name}: {exc}")
+            logger.warning("Site %s hot list failed: %s", site.name, exc)
+    raise RuntimeError("所有站台均無法取得熱門榜，請稍後再試。\n" + "\n".join(errors))
 
 
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
-def search_novels(keyword: str) -> list[dict]:
-    """搜尋小說，返回最多 10 筆（書名、作者、最新章節、URL）"""
-    session = make_session()
-    base = _warm_up_session(session)
-    search_url = f"{base}/search.php"
-    logger.info("Searching keyword: %s", keyword)
-
-    session.headers["Referer"] = base + "/"
-    session.headers["Sec-Fetch-Site"] = "same-origin"
-
-    # Try POST first, fallback to GET
-    try:
-        _rotate_ua(session)
-        resp = session.post(
-            search_url,
-            data={"searchkey": keyword, "submit": ""},
-            timeout=30,
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-        _sleep()
-        html = _decode(resp)
-    except Exception as exc:
-        logger.warning("POST search failed (%s), trying GET", exc)
-        try:
-            resp = fetch(session, f"{base}/search.php?searchkey={keyword}")
-            html = _decode(resp)
-        except Exception:
-            resp = fetch(session, f"{base}/search/{keyword}/")
-            html = _decode(resp)
-
-    soup = BeautifulSoup(html, "lxml")
+def _parse_search(soup: BeautifulSoup, site: SiteConfig, base: str) -> list[dict]:
     novels: list[dict] = []
-
-    for sel in (
-        ".search-list li",
-        ".novelslist2 li",
-        "#searchmain li",
-        ".bookbox",
-        ".result-item",
-        "ul.books li",
-        ".booklist li",
-        "ul li",
-    ):
+    for sel in site.search_item_sels:
         items = soup.select(sel)
-        if items:
-            logger.info("Search selector '%s' → %d items", sel, len(items))
-            for item in items[:10]:
-                title_el = item.select_one("h3 a, .bookname a, h4 a, a.name, dt a")
-                if not title_el:
-                    title_el = item.select_one("a")
-                author_el = item.select_one(".author, .writer, span.author, dd.author")
-                latest_el = item.select_one(".update a, .latest a, .newchapter a, dd.update a")
+        if not items:
+            continue
+        logger.info("[%s] search selector '%s' → %d items", site.name, sel, len(items))
+        for item in items[:10]:
+            title_el = None
+            for ts in site.search_title_sels:
+                title_el = item.select_one(ts)
                 if title_el:
-                    title = title_el.get_text(strip=True)
-                    if len(title) < 2:
-                        continue
-                    novels.append(
-                        {
-                            "title": title,
-                            "url": title_el.get("href", ""),
-                            "author": author_el.get_text(strip=True) if author_el else "未知",
-                            "latest": latest_el.get_text(strip=True) if latest_el else "未知",
-                        }
-                    )
-            if novels:
-                break
+                    break
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            if len(title) < 2:
+                continue
+            href = title_el.get("href", "")
+            full_url = href if href.startswith("http") else urljoin(base, href)
 
-    logger.info("Search: found %d results", len(novels))
+            author_el = None
+            for s in site.search_author_sels:
+                author_el = item.select_one(s)
+                if author_el:
+                    break
+
+            latest_el = None
+            for s in site.search_latest_sels:
+                latest_el = item.select_one(s)
+                if latest_el:
+                    break
+
+            novels.append(
+                {
+                    "title": title,
+                    "url": full_url,
+                    "author": author_el.get_text(strip=True) if author_el else "未知",
+                    "latest": latest_el.get_text(strip=True) if latest_el else "未知",
+                    "_site": site,
+                }
+            )
+        if novels:
+            break
     return novels
+
+
+def _search_from_site(site: SiteConfig, keyword: str) -> list[dict]:
+    scraper = make_session()
+    base = _warm_up(scraper, site)
+    scraper.headers["Referer"] = base + "/"
+    search_url = base + site.search_path
+
+    try:
+        if site.search_method.upper() == "POST":
+            resp = scraper.post(
+                search_url,
+                data={site.search_param: keyword, "submit": ""},
+                timeout=30,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            _sleep()
+        else:
+            resp = _fetch(scraper, f"{search_url}?{site.search_param}={keyword}")
+    except Exception as exc:
+        # Fallback: try GET if POST failed
+        logger.warning("[%s] search primary failed (%s), trying GET fallback", site.name, exc)
+        resp = _fetch(scraper, f"{search_url}?{site.search_param}={keyword}")
+
+    html = _decode(resp)
+    soup = BeautifulSoup(html, "lxml")
+    return _parse_search(soup, site, base)
+
+
+def search_novels(keyword: str) -> list[dict]:
+    """輪流嘗試各站台搜尋，返回最多 10 筆結果"""
+    errors: list[str] = []
+    for site in SITES:
+        try:
+            results = _search_from_site(site, keyword)
+            if results:
+                logger.info("Search '%s' → %d results from %s", keyword, len(results), site.name)
+                return results
+        except Exception as exc:
+            errors.append(f"{site.name}: {exc}")
+            logger.warning("Site %s search failed: %s", site.name, exc)
+    raise RuntimeError("所有站台均無法搜尋，請稍後再試。\n" + "\n".join(errors))
 
 
 # ---------------------------------------------------------------------------
 # Book info + chapter list
 # ---------------------------------------------------------------------------
 
+def _detect_site(book_url: str) -> SiteConfig:
+    """依 URL 判斷屬於哪個站台，找不到則回傳第一個"""
+    for site in SITES:
+        domain = urlparse(site.base_url).netloc.replace("www.", "")
+        if domain in book_url:
+            return site
+    return SITES[0]
+
+
 def get_book_info(book_url: str) -> dict:
     """返回 {'title': str, 'chapters': [{'title': str, 'url': str}]}"""
-    session = make_session()
-    base = _warm_up_session(session)
+    site = _detect_site(book_url)
+    scraper = make_session()
+    base = _warm_up(scraper, site)
+
     if not book_url.startswith("http"):
         book_url = base + book_url
 
-    session.headers["Referer"] = base + "/"
-    session.headers["Sec-Fetch-Site"] = "same-origin"
+    scraper.headers["Referer"] = base + "/"
+    logger.info("[%s] getting book info: %s", site.name, book_url)
 
-    logger.info("Getting book info: %s", book_url)
-    resp = fetch(session, book_url)
+    resp = _fetch(scraper, book_url)
     html = _decode(resp)
     soup = BeautifulSoup(html, "lxml")
 
-    # Book title
     title_el = soup.select_one("h1, .booktitle, .book-title, #bookinfo h1, .book-info h1")
     title = title_el.get_text(strip=True) if title_el else "未知"
 
-    chapters = _extract_chapters(soup, book_url)
+    chapters = _extract_chapters(soup, site, book_url)
 
-    # If no chapters on main page, try /catalog/ sub-page
     if not chapters:
-        for catalog_suffix in ("/catalog/", "/list/", "/index.html"):
-            catalog_url = book_url.rstrip("/") + catalog_suffix
-            logger.info("Trying catalog page: %s", catalog_url)
+        for suffix in ("/catalog/", "/list/", "/index.html"):
+            catalog_url = book_url.rstrip("/") + suffix
+            logger.info("[%s] trying catalog: %s", site.name, catalog_url)
             try:
-                resp2 = fetch(session, catalog_url)
+                resp2 = _fetch(scraper, catalog_url)
                 soup2 = BeautifulSoup(_decode(resp2), "lxml")
-                chapters = _extract_chapters(soup2, book_url)
+                chapters = _extract_chapters(soup2, site, book_url)
                 if chapters:
                     break
             except Exception as exc:
-                logger.warning("Catalog page failed (%s): %s", catalog_url, exc)
+                logger.warning("[%s] catalog page failed: %s", site.name, exc)
 
-    logger.info("Book '%s': %d chapters", title, len(chapters))
+    logger.info("[%s] book '%s': %d chapters", site.name, title, len(chapters))
     return {"title": title, "chapters": chapters}
 
 
-def _extract_chapters(soup: BeautifulSoup, base_url: str) -> list[dict]:
-    """從 BeautifulSoup 物件中提取章節清單"""
+def _extract_chapters(soup: BeautifulSoup, site: SiteConfig, base_url: str) -> list[dict]:
     chapters: list[dict] = []
-    for sel in (
-        "#chapters a",
-        "#chapterlist a",
-        ".chapterlist a",
-        "#list a",
-        ".listmain a",
-        "#catalog a",
-        ".catalog a",
-        ".chapter-list a",
-        "#booklist a",
-        "#all-chapter a",
-    ):
+    parsed_base = urlparse(base_url)
+    origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    for sel in site.chapter_list_sels:
         els = soup.select(sel)
-        if els:
-            logger.info("Chapter selector '%s' → %d chapters", sel, len(els))
-            for el in els:
-                href = el.get("href", "")
-                title = el.get_text(strip=True)
-                if href and title and len(title) > 1:
-                    full_url = href if href.startswith("http") else BASE_URL + href
-                    chapters.append({"title": title, "url": full_url})
-            break
+        if not els:
+            continue
+        logger.info("[%s] chapter selector '%s' → %d", site.name, sel, len(els))
+        for el in els:
+            href = el.get("href", "")
+            ch_title = el.get_text(strip=True)
+            if href and ch_title and len(ch_title) > 1:
+                full_url = href if href.startswith("http") else urljoin(origin, href)
+                chapters.append({"title": ch_title, "url": full_url})
+        break
     return chapters
 
 
@@ -409,24 +489,26 @@ def _extract_chapters(soup: BeautifulSoup, base_url: str) -> list[dict]:
 # Chapter content
 # ---------------------------------------------------------------------------
 
-def get_chapter_content(chapter_url: str, session: requests.Session | None = None) -> tuple[str, str]:
+def get_chapter_content(
+    chapter_url: str,
+    session: Optional[cloudscraper.CloudScraper] = None,
+) -> tuple[str, str]:
     """
     下載並清洗單章內文。
     返回 (chapter_title, cleaned_text)
+    session 參數接受 CloudScraper 實例（与 downloader.py 共用）。
     """
     if session is None:
         session = make_session()
-        _warm_up_session(session)
+        site = _detect_site(chapter_url)
+        _warm_up(session, site)
 
-    # Referer 設為同一本書的目錄頁（取 URL 的上層路徑）
-    from urllib.parse import urlparse
+    # Referer 設為書籍目錄頁（chapter_url 的上層路徑）
     parsed = urlparse(chapter_url)
-    parts = parsed.path.rsplit("/", 1)
-    referer_path = parts[0] + "/" if len(parts) > 1 else "/"
-    session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}{referer_path}"
-    session.headers["Sec-Fetch-Site"] = "same-origin"
+    parent_path = parsed.path.rsplit("/", 1)[0] + "/"
+    session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
 
-    resp = fetch(session, chapter_url)
+    resp = _fetch(session, chapter_url)
     html = _decode(resp)
     soup = BeautifulSoup(html, "lxml")
 
@@ -434,21 +516,11 @@ def get_chapter_content(chapter_url: str, session: requests.Session | None = Non
     title_el = soup.select_one("h1, .chapter-title, #bookname, .readtitle")
     chapter_title = title_el.get_text(strip=True) if title_el else ""
 
-    # Content container
+    # Detect site for content selectors
+    site = _detect_site(chapter_url)
+
     content_div = None
-    for sel in (
-        "#content",
-        ".content",
-        "#chaptercontent",
-        ".chapter-content",
-        "#nr",
-        "#booktxt",
-        ".booktxt",
-        "#txtnav",
-        ".txtnav",
-        "div.read-content",
-        "div#readcontent",
-    ):
+    for sel in site.content_sels:
         content_div = soup.select_one(sel)
         if content_div:
             break
@@ -457,27 +529,21 @@ def get_chapter_content(chapter_url: str, session: requests.Session | None = Non
         logger.warning("No content div found for: %s", chapter_url)
         return chapter_title, ""
 
-    # Strip unwanted tags
-    for tag in content_div.select("script, style, .ad, .ads, .adsbygoogle, ins, iframe"):
+    # Remove noise tags
+    for tag in content_div.select("script, style, .ad, .ads, .adsbygoogle, ins, iframe, a"):
         tag.decompose()
-    for a in content_div.find_all("a"):
-        a.decompose()
 
-    raw_text = content_div.get_text("\n")
+    raw = content_div.get_text("\n")
 
-    # Clean lines
     cleaned: list[str] = []
-    prev_line = None
-    for line in raw_text.splitlines():
+    prev = None
+    for line in raw.splitlines():
         line = line.strip()
-        if not line:
+        if not line or _SKIP_RE.search(line):
             continue
-        if _SKIP_RE.search(line):
-            continue
-        # Deduplicate consecutive identical lines
-        if line == prev_line:
+        if line == prev:
             continue
         cleaned.append(line)
-        prev_line = line
+        prev = line
 
     return chapter_title, "\n".join(cleaned)
