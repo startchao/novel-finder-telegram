@@ -1,12 +1,14 @@
 """
 scraper.py — 多站點輪流爬取模組
-使用 cloudscraper 繞過 Cloudflare / WAF，支援 4 個站台自動備援。
+使用 cloudscraper 繞過 Cloudflare / WAF，支援 6 個站台自動備援。
 
 站台優先順序：
   1. 69書吧      (www.69shuba.cx / .com)
   2. 飄天文學    (www.ptwxz.com)
-  3. 新笔趣阁    (www.xbiquge.so)
-  4. 台灣小說王  (twkan.com)
+  3. UU看書      (www.uukanshu.com)
+  4. 新笔趣阁    (www.xbiquge.la / .so)
+  5. 小說狂人    (czbooks.net)
+  6. 23小時      (www.23us.so)
 """
 
 import re
@@ -99,9 +101,66 @@ SITE_PTWXZ = SiteConfig(
     encoding="gb18030",
 )
 
+SITE_UUKANSHU = SiteConfig(
+    name="UU看書",
+    base_url="https://www.uukanshu.com",
+    hot_paths=["/top/", "/top/allvisit/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.ranking li", ".ranking li", "ul.topbooks li", ".rank-list li", "ol li"],
+    search_path="/search/",
+    search_method="GET",
+    search_param="q",
+    search_item_sels=[".resultbox li", ".result-list li", ".search-list li", "ul.list li"],
+    search_title_sels=[".bookname a", "h3 a", "dt a", "a"],
+    search_author_sels=[".author", "span.author", ".writer"],
+    search_latest_sels=[".update a", ".lastchapter a", ".newchapter a"],
+    chapter_list_sels=["ul.chapterlist li a", "dl dd a", "#chapters a", "#list a", ".chapterlist a"],
+    content_sels=["#contentbox", ".contentbox", "#content", ".content"],
+    encoding="utf-8",
+)
+
 SITE_XBIQUGE = SiteConfig(
     name="新笔趣阁",
-    base_url="https://www.xbiquge.so",
+    base_url="https://www.xbiquge.la",   # .la 為目前較穩定的鏡像；.so 已備註為備援
+    hot_paths=["/top/allvisit/", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "ol li", "ul.list li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "dt a", "a"],
+    search_author_sels=[".author", "span.author"],
+    search_latest_sels=[".update a", ".newchapter a"],
+    chapter_list_sels=["#list a", "#chapters a", ".chapterlist a"],
+    content_sels=["#content", ".content", "#chaptercontent"],
+    encoding="utf-8",
+)
+
+SITE_CZBOOKS = SiteConfig(
+    name="小說狂人",
+    base_url="https://czbooks.net",
+    hot_paths=["/rank/", "/ranking/", "/top/", "/"],
+    hot_cat_tpl="/rank/{cat}/",
+    category_map={"玄幻": "xuanhuan", "仙俠": "xianxia", "都市": "dushi", "穿越": "chuanyue"},
+    hot_item_sels=[".rank-list li", ".novel-list li", "ul.list li", "ol li"],
+    search_path="/search",
+    search_method="GET",
+    search_param="q",
+    search_item_sels=[".novel-list li", ".search-result li", "ul.list li"],
+    search_title_sels=[".title a", "h3 a", "h2 a", ".bookname a", "a"],
+    search_author_sels=[".author", ".writer", "span.author"],
+    search_latest_sels=[".last-chapter a", ".update a", ".newchapter a"],
+    chapter_list_sels=["#chapters-list a", "#chapter-list a", ".chapter-list a", "#list a", "ul.list a"],
+    content_sels=["#novel-content", ".chapter-content", "#content", ".content"],
+    encoding="utf-8",
+)
+
+SITE_23US = SiteConfig(
+    name="23小時",
+    base_url="https://www.23us.so",
     hot_paths=["/top/allvisit/", "/top/", "/"],
     hot_cat_tpl="/top/{cat}/",
     category_map=CATEGORY_MAP,
@@ -115,30 +174,18 @@ SITE_XBIQUGE = SiteConfig(
     search_latest_sels=[".update a", ".newchapter a"],
     chapter_list_sels=["#list a", "#chapters a", ".chapterlist a"],
     content_sels=["#content", ".content", "#chaptercontent"],
-    encoding="utf-8",
-)
-
-SITE_TWKAN = SiteConfig(
-    name="台灣小說王",
-    base_url="https://twkan.com",
-    hot_paths=["/top/", "/"],
-    hot_cat_tpl="/top/{cat}/",
-    category_map={"玄幻": "xuanhuan", "都市": "dushi"},
-    hot_item_sels=[".topbooks li", ".rank-list li", "ul li"],
-    search_path="/search.php",
-    search_method="GET",
-    search_param="searchkey",
-    search_item_sels=[".novelslist2 li", ".search-list li", "ul li"],
-    search_title_sels=["h3 a", ".bookname a", "a"],
-    search_author_sels=[".author"],
-    search_latest_sels=[".update a"],
-    chapter_list_sels=["#list a", "#chapters a"],
-    content_sels=["#txtcontent", "#content", ".content"],
-    encoding="utf-8",
+    encoding="gb18030",
 )
 
 # 站台優先順序
-SITES: list[SiteConfig] = [SITE_69SHUBA, SITE_PTWXZ, SITE_XBIQUGE, SITE_TWKAN]
+SITES: list[SiteConfig] = [
+    SITE_69SHUBA,   # GB18030，biquge 風格，最熱門
+    SITE_PTWXZ,     # GB18030，飄天文學
+    SITE_UUKANSHU,  # UTF-8，UU看書，大陸最大之一
+    SITE_XBIQUGE,   # UTF-8，新笔趣阁
+    SITE_CZBOOKS,   # UTF-8，台灣小說狂人
+    SITE_23US,      # GB18030，23小時
+]
 
 # ---------------------------------------------------------------------------
 # 內文清洗 pattern
@@ -231,8 +278,20 @@ def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 3, **kwarg
 def _warm_up(scraper, site: SiteConfig) -> str:
     """
     先訪問首頁取得 Cookie，返回實際 base URL（跟蹤重定向）。
+    69shuba 額外嘗試 .com 備援域名。
     """
-    for url in (site.base_url, site.base_url.replace(".cx", ".com")):
+    candidates = [site.base_url]
+    # 69shuba 特別備援：.cx ↔ .com 互相嘗試
+    if ".cx" in site.base_url:
+        candidates.append(site.base_url.replace(".cx", ".com"))
+    elif "69shuba.com" in site.base_url:
+        candidates.append(site.base_url.replace(".com", ".cx"))
+    # xbiquge 備援域名
+    if "xbiquge.la" in site.base_url:
+        candidates.append(site.base_url.replace(".la", ".so"))
+        candidates.append(site.base_url.replace(".la", ".bid"))
+
+    for url in candidates:
         try:
             resp = scraper.get(url + "/", timeout=20, allow_redirects=True)
             if resp.status_code == 200:
