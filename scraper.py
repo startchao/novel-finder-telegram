@@ -13,7 +13,9 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+# 主域名，會在 warm-up 時依重定向自動更新
 BASE_URL = "https://www.69shuba.cx"
+_effective_base: str = BASE_URL  # 追蹤實際域名（可能被重定向到 .com）
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -52,19 +54,51 @@ _SKIP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def make_session() -> requests.Session:
-    """建立帶有隨機 UA 的 requests.Session"""
+    """建立帶有隨機 UA 的 requests.Session（模擬 Chrome 瀏覽器完整標頭）"""
     session = requests.Session()
     _rotate_ua(session)
     session.headers.update(
         {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
         }
     )
     return session
+
+
+def _warm_up_session(session: requests.Session) -> str:
+    """
+    先訪問首頁取得 Cookie 與正確 domain（.cx 可能重定向到 .com）。
+    返回實際生效的 base URL（例如 https://www.69shuba.com）。
+    """
+    global _effective_base
+    for domain in (BASE_URL, "https://www.69shuba.com", "https://69shuba.com"):
+        try:
+            _rotate_ua(session)
+            session.headers["Sec-Fetch-Site"] = "none"
+            resp = session.get(domain + "/", timeout=20, allow_redirects=True)
+            if resp.status_code == 200:
+                from urllib.parse import urlparse
+                parsed = urlparse(resp.url)
+                _effective_base = f"{parsed.scheme}://{parsed.netloc}"
+                session.headers["Referer"] = _effective_base + "/"
+                session.headers["Sec-Fetch-Site"] = "same-origin"
+                logger.info("Session warm-up OK: effective base = %s", _effective_base)
+                _sleep()
+                return _effective_base
+            logger.warning("Warm-up %s returned %s", domain, resp.status_code)
+        except Exception as exc:
+            logger.warning("Warm-up failed for %s: %s", domain, exc)
+    logger.warning("All warm-up attempts failed, using default: %s", BASE_URL)
+    return BASE_URL
 
 
 def _rotate_ua(session: requests.Session) -> None:
@@ -130,14 +164,39 @@ def fetch(
 def get_hot_list(category: str | None = None) -> list[dict]:
     """返回 Top 20 熱門小說（含排名、書名、URL）"""
     session = make_session()
+    base = _warm_up_session(session)  # 先取得 Cookie + 正確 domain
+
     if category and category in CATEGORY_MAP:
         cat_key = CATEGORY_MAP[category]
-        url = f"{BASE_URL}/top/{cat_key}/"
+        candidate_urls = [
+            f"{base}/top/{cat_key}/",
+            f"{base}/top/{cat_key}.htm",
+            f"{base}/top/",
+        ]
     else:
-        url = f"{BASE_URL}/top/allvisit/"
+        candidate_urls = [
+            f"{base}/top/allvisit/",
+            f"{base}/top/allvisit.htm",
+            f"{base}/top/",
+            f"{base}/",           # 首頁通常也有熱門榜
+        ]
+
+    resp = None
+    url = candidate_urls[0]
+    for candidate in candidate_urls:
+        try:
+            logger.info("Trying hot list URL: %s", candidate)
+            session.headers["Referer"] = base + "/"
+            resp = fetch(session, candidate)
+            url = candidate
+            break
+        except Exception as exc:
+            logger.warning("Hot list URL %s failed: %s", candidate, exc)
+
+    if resp is None:
+        raise RuntimeError("所有熱門榜 URL 均無法訪問，請稍後再試。")
 
     logger.info("Fetching hot list: %s", url)
-    resp = fetch(session, url)
     html = _decode(resp)
     soup = BeautifulSoup(html, "lxml")
 
@@ -206,11 +265,16 @@ def get_hot_list(category: str | None = None) -> list[dict]:
 def search_novels(keyword: str) -> list[dict]:
     """搜尋小說，返回最多 10 筆（書名、作者、最新章節、URL）"""
     session = make_session()
-    search_url = f"{BASE_URL}/search.php"
+    base = _warm_up_session(session)
+    search_url = f"{base}/search.php"
     logger.info("Searching keyword: %s", keyword)
+
+    session.headers["Referer"] = base + "/"
+    session.headers["Sec-Fetch-Site"] = "same-origin"
 
     # Try POST first, fallback to GET
     try:
+        _rotate_ua(session)
         resp = session.post(
             search_url,
             data={"searchkey": keyword, "submit": ""},
@@ -223,10 +287,10 @@ def search_novels(keyword: str) -> list[dict]:
     except Exception as exc:
         logger.warning("POST search failed (%s), trying GET", exc)
         try:
-            resp = fetch(session, f"{BASE_URL}/search.php?searchkey={keyword}")
+            resp = fetch(session, f"{base}/search.php?searchkey={keyword}")
             html = _decode(resp)
         except Exception:
-            resp = fetch(session, f"{BASE_URL}/search/{keyword}/")
+            resp = fetch(session, f"{base}/search/{keyword}/")
             html = _decode(resp)
 
     soup = BeautifulSoup(html, "lxml")
@@ -277,8 +341,12 @@ def search_novels(keyword: str) -> list[dict]:
 def get_book_info(book_url: str) -> dict:
     """返回 {'title': str, 'chapters': [{'title': str, 'url': str}]}"""
     session = make_session()
+    base = _warm_up_session(session)
     if not book_url.startswith("http"):
-        book_url = BASE_URL + book_url
+        book_url = base + book_url
+
+    session.headers["Referer"] = base + "/"
+    session.headers["Sec-Fetch-Site"] = "same-origin"
 
     logger.info("Getting book info: %s", book_url)
     resp = fetch(session, book_url)
@@ -348,6 +416,15 @@ def get_chapter_content(chapter_url: str, session: requests.Session | None = Non
     """
     if session is None:
         session = make_session()
+        _warm_up_session(session)
+
+    # Referer 設為同一本書的目錄頁（取 URL 的上層路徑）
+    from urllib.parse import urlparse
+    parsed = urlparse(chapter_url)
+    parts = parsed.path.rsplit("/", 1)
+    referer_path = parts[0] + "/" if len(parts) > 1 else "/"
+    session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}{referer_path}"
+    session.headers["Sec-Fetch-Site"] = "same-origin"
 
     resp = fetch(session, chapter_url)
     html = _decode(resp)
