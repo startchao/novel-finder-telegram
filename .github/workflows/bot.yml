@@ -8,6 +8,12 @@ on:
         required: false
         default: "1200"
         type: string
+  schedule:
+    - cron: "*/15 * * * *"   # 每 15 分鐘自動觸發
+
+concurrency:
+  group: novel-bot
+  cancel-in-progress: false   # 勿取消正在下載的 job，等它完成後再接班
 
 jobs:
   run-bot:
@@ -30,5 +36,5 @@ jobs:
       - name: Run Novel Finder Bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          BOT_LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || '1200' }}
+          BOT_LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || '1200' }}   # 排程觸發也用 1200 秒
         run: python bot.py
