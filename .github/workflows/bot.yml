@@ -1,0 +1,34 @@
+name: Novel Finder Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      lifetime_seconds:
+        description: "Bot lifetime in seconds (default: 1200 = 20 min)"
+        required: false
+        default: "1200"
+        type: string
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Novel Finder Bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          BOT_LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || '1200' }}
+        run: python bot.py
