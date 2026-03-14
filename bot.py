@@ -1,13 +1,14 @@
 """
 bot.py — Novel Finder Telegram Bot
-架構：python-telegram-bot v20.7，全 async，ConversationHandler，long-polling
-執行時間由 BOT_LIFETIME_SECONDS 環境變數控制（預設 1200 秒）
+架構：python-telegram-bot v20.7，全 async，ConversationHandler，webhook 模式
+常駐運行於 Render.com，透過 aiohttp 同時提供 /telegram（webhook）與 /health 端點。
 """
 
 import asyncio
 import logging
 import os
 
+from aiohttp import web
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -35,7 +36,8 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN: str = os.environ["TELEGRAM_TOKEN"]
-BOT_LIFETIME: int = int(os.environ.get("BOT_LIFETIME_SECONDS", "1200"))
+WEBHOOK_URL: str = os.environ["WEBHOOK_URL"]       # e.g. https://your-app.onrender.com
+PORT: int = int(os.environ.get("PORT", "8443"))
 
 # ---------------------------------------------------------------------------
 # Conversation states
@@ -305,32 +307,60 @@ def build_app():
 
 
 # ---------------------------------------------------------------------------
-# Main — manual async run with lifetime control
+# Webhook + Health server（單一 aiohttp app，處理 /telegram 與 /health）
+# ---------------------------------------------------------------------------
+
+async def _build_web_app(bot_app) -> web.Application:
+    web_app = web.Application()
+
+    async def telegram_handler(request: web.Request) -> web.Response:
+        data = await request.json()
+        update = Update.de_json(data, bot_app.bot)
+        await bot_app.process_update(update)
+        return web.Response(text="OK")
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    web_app.router.add_post("/telegram", telegram_handler)
+    web_app.router.add_get("/health", health_handler)
+    web_app.router.add_get("/", health_handler)   # Render 自身的 health check 打 /
+    return web_app
+
+
+# ---------------------------------------------------------------------------
+# Main — webhook 模式，常駐運行
 # ---------------------------------------------------------------------------
 
 async def run() -> None:
-    app = build_app()
+    bot_app = build_app()
 
-    logger.info("Initializing bot (lifetime=%ds)...", BOT_LIFETIME)
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(
+    logger.info("Initializing bot (webhook mode)...")
+    await bot_app.initialize()
+    await bot_app.start()
+
+    webhook_path = f"{WEBHOOK_URL}/telegram"
+    await bot_app.bot.set_webhook(
+        url=webhook_path,
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
-        pool_timeout=30,
     )
+    logger.info("Webhook registered: %s", webhook_path)
 
-    logger.info("Bot is running. Will stop after %d seconds.", BOT_LIFETIME)
-    await asyncio.sleep(BOT_LIFETIME)
+    web_app = await _build_web_app(bot_app)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info("Web server listening on 0.0.0.0:%d", PORT)
 
-    logger.info("Lifetime reached — shutting down gracefully.")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    logger.info("Bot stopped.")
+    try:
+        await asyncio.Event().wait()   # 永久阻塞，直到行程被終止
+    finally:
+        logger.info("Shutting down...")
+        await runner.cleanup()
+        await bot_app.stop()
+        await bot_app.shutdown()
 
 
 if __name__ == "__main__":

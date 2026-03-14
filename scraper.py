@@ -19,10 +19,17 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, urljoin
 
+import os
+import urllib.parse
+
 import cloudscraper
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# CF Workers proxy base URL. When set, all novel-site requests are routed
+# through the proxy instead of directly. Falls back to direct if not set.
+PROXY_BASE: str = os.environ.get("PROXY_BASE", "").rstrip("/")
 
 # ---------------------------------------------------------------------------
 # 共用分類對照表（用於 bot.py 顯示支援清單）
@@ -250,12 +257,41 @@ def _decode(resp) -> str:
         return resp.content.decode("utf-8", errors="replace")
 
 
+def _fetch_via_proxy(scraper, url: str, method: str = "GET", **kwargs):
+    """透過 CF Workers 代理發出請求"""
+    params: dict = {"url": url, "method": method.upper()}
+
+    referer = scraper.headers.get("Referer", "")
+    if referer:
+        params["referer"] = referer
+
+    parsed_url = urllib.parse.urlparse(url)
+    cookie_dict = (
+        scraper.cookies.get_dict(domain=parsed_url.netloc)
+        or scraper.cookies.get_dict()
+    )
+    if cookie_dict:
+        params["cookie"] = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+
+    if method.upper() == "POST" and "data" in kwargs:
+        data = kwargs["data"]
+        params["body"] = (
+            urllib.parse.urlencode(data) if isinstance(data, dict) else data
+        )
+
+    proxy_url = PROXY_BASE + "/?" + urllib.parse.urlencode(params)
+    logger.debug("Proxy fetch: %s", proxy_url)
+    return scraper.get(proxy_url, timeout=20)
+
+
 def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 2, **kwargs):
     """帶 retry + 指數退避的請求（timeout=8s，最多重試 2 次）"""
     last_exc: Exception = RuntimeError(f"Failed: {url}")
     for attempt in range(max_retries):
         try:
-            if method.upper() == "POST":
+            if PROXY_BASE:
+                resp = _fetch_via_proxy(scraper, url, method, **kwargs)
+            elif method.upper() == "POST":
                 resp = scraper.post(url, timeout=8, **kwargs)
             else:
                 resp = scraper.get(url, timeout=8, **kwargs)
@@ -295,7 +331,10 @@ def _warm_up(scraper, site: SiteConfig) -> str:
 
     for url in candidates:
         try:
-            resp = scraper.get(url + "/", timeout=8, allow_redirects=True)
+            if PROXY_BASE:
+                resp = _fetch_via_proxy(scraper, url + "/", "GET")
+            else:
+                resp = scraper.get(url + "/", timeout=8, allow_redirects=True)
             if resp.status_code == 200:
                 parsed = urlparse(resp.url)
                 redirected_netloc = parsed.netloc
@@ -455,14 +494,12 @@ def _search_from_site(site: SiteConfig, keyword: str) -> list[dict]:
 
     try:
         if site.search_method.upper() == "POST":
-            resp = scraper.post(
+            resp = _fetch(
+                scraper,
                 search_url,
+                method="POST",
                 data={site.search_param: keyword, "submit": ""},
-                timeout=30,
-                allow_redirects=True,
             )
-            resp.raise_for_status()
-            _sleep()
         else:
             resp = _fetch(scraper, f"{search_url}?{site.search_param}={keyword}")
     except Exception as exc:
