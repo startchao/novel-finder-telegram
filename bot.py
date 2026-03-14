@@ -94,10 +94,16 @@ async def _do_hot(update: Update, category: str | None) -> int:
     await update.message.reply_text(f"⏳ 正在獲取「{cat_display}」熱門榜，請稍候...")
 
     try:
-        novels = await asyncio.to_thread(get_hot_list, category)
+        novels = await asyncio.wait_for(
+            asyncio.to_thread(get_hot_list, category),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ 所有站台均無回應（已等待 45 秒），請稍後再試。")
+        return IDLE
     except Exception as exc:
         logger.exception("Hot list error")
-        await update.message.reply_text(f"❌ 獲取失敗：{str(exc)[:200]}")
+        await update.message.reply_text(f"❌ 獲取失敗：{str(exc)[:300]}")
         return IDLE
 
     if not novels:
@@ -122,10 +128,16 @@ async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(f"🔍 正在搜尋「{keyword}」，請稍候...")
 
     try:
-        results = await asyncio.to_thread(search_novels, keyword)
+        results = await asyncio.wait_for(
+            asyncio.to_thread(search_novels, keyword),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ 所有站台均無回應（已等待 45 秒），請稍後再試。")
+        return IDLE
     except Exception as exc:
         logger.exception("Search error")
-        await update.message.reply_text(f"❌ 搜尋失敗：{str(exc)[:200]}")
+        await update.message.reply_text(f"❌ 搜尋失敗：{str(exc)[:300]}")
         return IDLE
 
     if not results:
@@ -178,10 +190,16 @@ async def msg_choose_book(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Get chapter list
     try:
-        book_info = await asyncio.to_thread(get_book_info, book_url)
+        book_info = await asyncio.wait_for(
+            asyncio.to_thread(get_book_info, book_url),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ 獲取章節列表超時（45 秒），請稍後再試。")
+        return IDLE
     except Exception as exc:
         logger.exception("get_book_info error")
-        await update.message.reply_text(f"❌ 獲取章節列表失敗：{str(exc)[:200]}")
+        await update.message.reply_text(f"❌ 獲取章節列表失敗：{str(exc)[:300]}")
         return IDLE
 
     chapters = book_info.get("chapters", [])
