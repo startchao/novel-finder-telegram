@@ -250,23 +250,24 @@ def _decode(resp) -> str:
         return resp.content.decode("utf-8", errors="replace")
 
 
-def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 3, **kwargs):
-    """帶 retry + 指數退避的請求"""
+def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 2, **kwargs):
+    """帶 retry + 指數退避的請求（timeout=8s，最多重試 2 次）"""
     last_exc: Exception = RuntimeError(f"Failed: {url}")
     for attempt in range(max_retries):
         try:
             if method.upper() == "POST":
-                resp = scraper.post(url, timeout=30, **kwargs)
+                resp = scraper.post(url, timeout=8, **kwargs)
             else:
-                resp = scraper.get(url, timeout=30, **kwargs)
+                resp = scraper.get(url, timeout=8, **kwargs)
             resp.raise_for_status()
             _sleep()
             return resp
         except Exception as exc:
             last_exc = exc
             if hasattr(exc, "response") and exc.response is not None:
-                if exc.response.status_code == 404:
-                    raise
+                code = exc.response.status_code
+                if code in (403, 404):
+                    raise   # 明確拒絕/不存在，不需要 retry
             wait = 2 ** attempt
             logger.warning("Attempt %d/%d failed for %s: %s (wait %ds)",
                            attempt + 1, max_retries, url, exc, wait)
@@ -277,28 +278,44 @@ def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 3, **kwarg
 
 def _warm_up(scraper, site: SiteConfig) -> str:
     """
-    先訪問首頁取得 Cookie，返回實際 base URL（跟蹤重定向）。
-    69shuba 額外嘗試 .com 備援域名。
+    先訪問首頁取得 Cookie，返回可用的 base URL。
+    僅當重定向後的域名「核心詞」與原始相同時才更新 base URL，
+    避免跨站重定向導致後續路徑拼錯（如 ptwxz.com → piaotian.xxx）。
     """
     candidates = [site.base_url]
-    # 69shuba 特別備援：.cx ↔ .com 互相嘗試
     if ".cx" in site.base_url:
         candidates.append(site.base_url.replace(".cx", ".com"))
     elif "69shuba.com" in site.base_url:
         candidates.append(site.base_url.replace(".com", ".cx"))
-    # xbiquge 備援域名
     if "xbiquge.la" in site.base_url:
         candidates.append(site.base_url.replace(".la", ".so"))
         candidates.append(site.base_url.replace(".la", ".bid"))
 
+    orig_core = urlparse(site.base_url).netloc.replace("www.", "").split(".")[0]
+
     for url in candidates:
         try:
-            resp = scraper.get(url + "/", timeout=20, allow_redirects=True)
+            resp = scraper.get(url + "/", timeout=8, allow_redirects=True)
             if resp.status_code == 200:
                 parsed = urlparse(resp.url)
-                base = f"{parsed.scheme}://{parsed.netloc}"
-                scraper.headers["Referer"] = base + "/"
-                logger.info("[%s] warm-up OK → %s", site.name, base)
+                redirected_netloc = parsed.netloc
+                redirected_base = f"{parsed.scheme}://{redirected_netloc}"
+                redir_core = redirected_netloc.replace("www.", "").split(".")[0]
+
+                # 只在同一站台域名變體時採用重定向 URL（例如 .cx→.com）
+                # 跨站重定向（核心詞不同）則繼續用原始 base URL
+                if orig_core == redir_core:
+                    base = redirected_base
+                else:
+                    base = url.rstrip("/")
+                    logger.warning(
+                        "[%s] warm-up redirected to different domain (%s → %s), "
+                        "keeping original for URL construction",
+                        site.name, url, redirected_base,
+                    )
+
+                scraper.headers["Referer"] = redirected_base + "/"
+                logger.info("[%s] warm-up OK → using base: %s", site.name, base)
                 _sleep()
                 return base
         except Exception as exc:
