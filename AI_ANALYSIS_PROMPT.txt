@@ -1,0 +1,1172 @@
+================================================================
+專案分析請求：中文小說 Telegram Bot — 架構問題診斷與重設計
+================================================================
+
+【背景說明】
+這是一個 Telegram Bot 專案，讓使用者透過 Telegram 搜尋中文網路小說、
+查看熱門榜、並自動下載全本小說以 TXT 檔傳送。
+Bot 運行在 GitHub Actions（每 15 分鐘自動觸發，每次運行 20 分鐘）。
+
+【核心問題】
+GitHub Actions 使用美國 Microsoft Azure 資料中心 IP，
+所有目標中文小說站台均封鎖此類 IP（回傳 403 Forbidden 或直接 timeout）。
+使用者在台灣，手機直接訪問這些站台完全正常，但 Bot 完全無法運作。
+
+【請求事項】
+1. 分析根本問題與可能解法
+2. 提出免費的替代架構方案
+3. 如有需要，直接重新設計整個系統流程
+
+================================================================
+一、技術棧
+================================================================
+
+語言：Python 3.12
+Bot 框架：python-telegram-bot 20.7（async，long-polling）
+爬蟲：cloudscraper 1.2.71 + BeautifulSoup4 + lxml
+運行環境：GitHub Actions（Ubuntu Latest）
+觸發方式：cron 排程（每 15 分鐘）+ 手動觸發
+
+requirements.txt：
+  python-telegram-bot==20.7
+  requests==2.31.0
+  beautifulsoup4==4.12.2
+  lxml==4.9.3
+  cloudscraper==1.2.71
+
+================================================================
+二、專案檔案結構
+================================================================
+
+novel-finder-telegram/
+├── .github/workflows/bot.yml   # GitHub Actions workflow
+├── bot.py                      # Telegram Bot 主程式
+├── scraper.py                  # 多站台爬取引擎
+├── downloader.py               # 章節下載 + TXT 產製
+└── requirements.txt
+
+================================================================
+三、完整原始碼
+================================================================
+
+----------------------------------------------------------------
+【檔案 1/4】.github/workflows/bot.yml
+----------------------------------------------------------------
+
+name: Novel Finder Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      lifetime_seconds:
+        description: "Bot lifetime in seconds (default: 1200 = 20 min)"
+        required: false
+        default: "1200"
+        type: string
+  schedule:
+    - cron: "*/15 * * * *"   # 每 15 分鐘自動觸發
+
+concurrency:
+  group: novel-bot
+  cancel-in-progress: false   # 勿取消正在下載的 job，等它完成後再接班
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Novel Finder Bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          BOT_LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || '1200' }}
+        run: python bot.py
+
+----------------------------------------------------------------
+【檔案 2/4】scraper.py
+----------------------------------------------------------------
+
+"""
+scraper.py — 多站點輪流爬取模組
+使用 cloudscraper 繞過 Cloudflare / WAF，支援 6 個站台自動備援。
+
+站台優先順序：
+  1. 69書吧      (www.69shuba.cx / .com)
+  2. 飄天文學    (www.ptwxz.com)
+  3. UU看書      (www.uukanshu.com)
+  4. 新笔趣阁    (www.xbiquge.la / .so)
+  5. 小說狂人    (czbooks.net)
+  6. 23小時      (www.23us.so)
+"""
+
+import re
+import time
+import random
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urlparse, urljoin
+
+import cloudscraper
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 共用分類對照表
+# ---------------------------------------------------------------------------
+CATEGORY_MAP: dict[str, str] = {
+    "玄幻": "xuanhuan",
+    "仙侠": "xianxia",
+    "仙俠": "xianxia",
+    "都市": "dushi",
+    "穿越": "chuanyue",
+    "历史": "lishi",
+    "歷史": "lishi",
+    "悬疑": "xuanyi",
+    "懸疑": "xuanyi",
+}
+
+# ---------------------------------------------------------------------------
+# 站台設定
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SiteConfig:
+    name: str
+    base_url: str
+    hot_paths: list[str]           # 熱門榜 URL 路徑（依序嘗試）
+    hot_cat_tpl: str               # 分類榜模板，{cat} 替換為英文分類
+    category_map: dict[str, str]
+    hot_item_sels: list[str]       # 熱門榜 li 選擇器（依序嘗試）
+    search_path: str
+    search_method: str             # GET 或 POST
+    search_param: str
+    search_item_sels: list[str]
+    search_title_sels: list[str]
+    search_author_sels: list[str]
+    search_latest_sels: list[str]
+    chapter_list_sels: list[str]
+    content_sels: list[str]
+    encoding: str = "utf-8"
+
+
+SITE_69SHUBA = SiteConfig(
+    name="69書吧",
+    base_url="https://www.69shuba.cx",
+    hot_paths=["/top/allvisit/", "/top/allvisit.htm", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "#topbooks li", "ol li"],
+    search_path="/search.php",
+    search_method="POST",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "#searchmain li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "h4 a", "dt a"],
+    search_author_sels=[".author", ".writer", "span.author"],
+    search_latest_sels=[".update a", ".latest a", ".newchapter a"],
+    chapter_list_sels=["#chapters a", "#chapterlist a", ".chapterlist a", "#list a", ".listmain a"],
+    content_sels=["#content", ".content", "#chaptercontent", "#booktxt", "#txtnav"],
+    encoding="gb18030",
+)
+
+SITE_PTWXZ = SiteConfig(
+    name="飄天文學",
+    base_url="https://www.ptwxz.com",
+    hot_paths=["/top/allvisit/", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "ol li", "ul.list li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "dt a", "a"],
+    search_author_sels=[".author", "span.author"],
+    search_latest_sels=[".update a", ".newchapter a"],
+    chapter_list_sels=["#list a", "#chapters a", ".chapterlist a", ".listmain a"],
+    content_sels=["#content", ".content", "#chaptercontent"],
+    encoding="gb18030",
+)
+
+SITE_UUKANSHU = SiteConfig(
+    name="UU看書",
+    base_url="https://www.uukanshu.com",
+    hot_paths=["/top/", "/top/allvisit/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.ranking li", ".ranking li", "ul.topbooks li", ".rank-list li", "ol li"],
+    search_path="/search/",
+    search_method="GET",
+    search_param="q",
+    search_item_sels=[".resultbox li", ".result-list li", ".search-list li", "ul.list li"],
+    search_title_sels=[".bookname a", "h3 a", "dt a", "a"],
+    search_author_sels=[".author", "span.author", ".writer"],
+    search_latest_sels=[".update a", ".lastchapter a", ".newchapter a"],
+    chapter_list_sels=["ul.chapterlist li a", "dl dd a", "#chapters a", "#list a", ".chapterlist a"],
+    content_sels=["#contentbox", ".contentbox", "#content", ".content"],
+    encoding="utf-8",
+)
+
+SITE_XBIQUGE = SiteConfig(
+    name="新笔趣阁",
+    base_url="https://www.xbiquge.la",
+    hot_paths=["/top/allvisit/", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "ol li", "ul.list li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "dt a", "a"],
+    search_author_sels=[".author", "span.author"],
+    search_latest_sels=[".update a", ".newchapter a"],
+    chapter_list_sels=["#list a", "#chapters a", ".chapterlist a"],
+    content_sels=["#content", ".content", "#chaptercontent"],
+    encoding="utf-8",
+)
+
+SITE_CZBOOKS = SiteConfig(
+    name="小說狂人",
+    base_url="https://czbooks.net",
+    hot_paths=["/rank/", "/ranking/", "/top/", "/"],
+    hot_cat_tpl="/rank/{cat}/",
+    category_map={"玄幻": "xuanhuan", "仙俠": "xianxia", "都市": "dushi", "穿越": "chuanyue"},
+    hot_item_sels=[".rank-list li", ".novel-list li", "ul.list li", "ol li"],
+    search_path="/search",
+    search_method="GET",
+    search_param="q",
+    search_item_sels=[".novel-list li", ".search-result li", "ul.list li"],
+    search_title_sels=[".title a", "h3 a", "h2 a", ".bookname a", "a"],
+    search_author_sels=[".author", ".writer", "span.author"],
+    search_latest_sels=[".last-chapter a", ".update a", ".newchapter a"],
+    chapter_list_sels=["#chapters-list a", "#chapter-list a", ".chapter-list a", "#list a", "ul.list a"],
+    content_sels=["#novel-content", ".chapter-content", "#content", ".content"],
+    encoding="utf-8",
+)
+
+SITE_23US = SiteConfig(
+    name="23小時",
+    base_url="https://www.23us.so",
+    hot_paths=["/top/allvisit/", "/top/", "/"],
+    hot_cat_tpl="/top/{cat}/",
+    category_map=CATEGORY_MAP,
+    hot_item_sels=["ul.topbooks li", ".rank-books li", "ol li"],
+    search_path="/search.php",
+    search_method="GET",
+    search_param="searchkey",
+    search_item_sels=[".novelslist2 li", ".search-list li", "ul.list li"],
+    search_title_sels=["h3 a", ".bookname a", "dt a", "a"],
+    search_author_sels=[".author", "span.author"],
+    search_latest_sels=[".update a", ".newchapter a"],
+    chapter_list_sels=["#list a", "#chapters a", ".chapterlist a"],
+    content_sels=["#content", ".content", "#chaptercontent"],
+    encoding="gb18030",
+)
+
+SITES: list[SiteConfig] = [
+    SITE_69SHUBA,
+    SITE_PTWXZ,
+    SITE_UUKANSHU,
+    SITE_XBIQUGE,
+    SITE_CZBOOKS,
+    SITE_23US,
+]
+
+# ---------------------------------------------------------------------------
+# 內文清洗 pattern
+# ---------------------------------------------------------------------------
+_SKIP_RE = re.compile(
+    r"69.*?shuba|ptwxz|xbiquge|twkan|www\.|http[s]?://|"
+    r"上一[章節頁]|下一[章節頁]|返回書目|返回目錄|章節目錄|本章完|"
+    r"請記住.*?地址|最新網址|手機版|加入書架|推薦閱讀|笔趣阁|筆趣閣|"
+    r"第\s*\d+\s*頁\s*/\s*\d+|分享到",
+    re.IGNORECASE,
+)
+
+_NAV_TITLES = {
+    "首頁", "首页", "排行", "書架", "书架", "登入", "登录",
+    "注冊", "注册", "搜索", "搜尋", "分類", "分类",
+}
+
+# ---------------------------------------------------------------------------
+# Session / HTTP helpers
+# ---------------------------------------------------------------------------
+
+def make_session() -> cloudscraper.CloudScraper:
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+            interpreter="nodejs",
+        )
+    except Exception:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+        )
+    scraper.headers.update({
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    return scraper
+
+
+def _sleep() -> None:
+    time.sleep(random.uniform(1.0, 3.0))
+
+
+def _decode(resp) -> str:
+    enc = (resp.encoding or "").lower()
+    if enc in ("gb2312", "gbk", "gb18030"):
+        return resp.content.decode("gb18030", errors="replace")
+    apparent = resp.apparent_encoding or "utf-8"
+    try:
+        return resp.content.decode(apparent, errors="replace")
+    except Exception:
+        return resp.content.decode("utf-8", errors="replace")
+
+
+def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 2, **kwargs):
+    """timeout=8s，最多重試 2 次，403/404 立即放棄"""
+    last_exc: Exception = RuntimeError(f"Failed: {url}")
+    for attempt in range(max_retries):
+        try:
+            if method.upper() == "POST":
+                resp = scraper.post(url, timeout=8, **kwargs)
+            else:
+                resp = scraper.get(url, timeout=8, **kwargs)
+            resp.raise_for_status()
+            _sleep()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if hasattr(exc, "response") and exc.response is not None:
+                code = exc.response.status_code
+                if code in (403, 404):
+                    raise
+            wait = 2 ** attempt
+            logger.warning("Attempt %d/%d failed for %s: %s (wait %ds)",
+                           attempt + 1, max_retries, url, exc, wait)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+    raise last_exc
+
+
+def _warm_up(scraper, site: SiteConfig) -> str:
+    """
+    訪問首頁取得 Cookie。
+    僅在重定向後域名核心詞相同時才更新 base URL（避免跨站重定向造成路徑錯誤）。
+    """
+    candidates = [site.base_url]
+    if ".cx" in site.base_url:
+        candidates.append(site.base_url.replace(".cx", ".com"))
+    elif "69shuba.com" in site.base_url:
+        candidates.append(site.base_url.replace(".com", ".cx"))
+    if "xbiquge.la" in site.base_url:
+        candidates.append(site.base_url.replace(".la", ".so"))
+        candidates.append(site.base_url.replace(".la", ".bid"))
+
+    orig_core = urlparse(site.base_url).netloc.replace("www.", "").split(".")[0]
+
+    for url in candidates:
+        try:
+            resp = scraper.get(url + "/", timeout=8, allow_redirects=True)
+            if resp.status_code == 200:
+                parsed = urlparse(resp.url)
+                redirected_netloc = parsed.netloc
+                redirected_base = f"{parsed.scheme}://{redirected_netloc}"
+                redir_core = redirected_netloc.replace("www.", "").split(".")[0]
+
+                if orig_core == redir_core:
+                    base = redirected_base
+                else:
+                    base = url.rstrip("/")
+                    logger.warning(
+                        "[%s] warm-up redirected to different domain (%s → %s), keeping original",
+                        site.name, url, redirected_base,
+                    )
+
+                scraper.headers["Referer"] = redirected_base + "/"
+                logger.info("[%s] warm-up OK → using base: %s", site.name, base)
+                _sleep()
+                return base
+        except Exception as exc:
+            logger.warning("[%s] warm-up failed (%s): %s", site.name, url, exc)
+    return site.base_url
+
+
+# ---------------------------------------------------------------------------
+# Hot list
+# ---------------------------------------------------------------------------
+
+def _parse_hot(soup: BeautifulSoup, site: SiteConfig, base: str) -> list[dict]:
+    novels: list[dict] = []
+    for sel in site.hot_item_sels:
+        items = soup.select(sel)
+        if not items:
+            continue
+        for item in items:
+            link = item.select_one("a")
+            if not link:
+                continue
+            title = link.get_text(strip=True)
+            if len(title) < 2 or title in _NAV_TITLES:
+                continue
+            href = link.get("href", "")
+            full_url = href if href.startswith("http") else urljoin(base, href)
+            novels.append({"rank": len(novels) + 1, "title": title, "url": full_url})
+            if len(novels) >= 20:
+                break
+        if novels:
+            break
+    return novels
+
+
+def _hot_from_site(site: SiteConfig, category: Optional[str]) -> list[dict]:
+    scraper = make_session()
+    base = _warm_up(scraper, site)
+    scraper.headers["Referer"] = base + "/"
+
+    if category and category in site.category_map:
+        cat_key = site.category_map[category]
+        paths = [site.hot_cat_tpl.format(cat=cat_key)] + site.hot_paths
+    else:
+        paths = site.hot_paths
+
+    for path in paths:
+        url = base + path
+        try:
+            resp = _fetch(scraper, url)
+            html = _decode(resp)
+            soup = BeautifulSoup(html, "lxml")
+            novels = _parse_hot(soup, site, base)
+            if novels:
+                return novels
+        except Exception as exc:
+            logger.warning("[%s] hot URL %s failed: %s", site.name, url, exc)
+    return []
+
+
+def get_hot_list(category: Optional[str] = None) -> list[dict]:
+    errors: list[str] = []
+    for site in SITES:
+        try:
+            novels = _hot_from_site(site, category)
+            if novels:
+                return novels
+        except Exception as exc:
+            errors.append(f"{site.name}: {exc}")
+    raise RuntimeError("所有站台均無法取得熱門榜。\n" + "\n".join(errors))
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+def _parse_search(soup: BeautifulSoup, site: SiteConfig, base: str) -> list[dict]:
+    novels: list[dict] = []
+    for sel in site.search_item_sels:
+        items = soup.select(sel)
+        if not items:
+            continue
+        for item in items[:10]:
+            title_el = None
+            for ts in site.search_title_sels:
+                title_el = item.select_one(ts)
+                if title_el:
+                    break
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            if len(title) < 2:
+                continue
+            href = title_el.get("href", "")
+            full_url = href if href.startswith("http") else urljoin(base, href)
+            author_el = None
+            for s in site.search_author_sels:
+                author_el = item.select_one(s)
+                if author_el:
+                    break
+            latest_el = None
+            for s in site.search_latest_sels:
+                latest_el = item.select_one(s)
+                if latest_el:
+                    break
+            novels.append({
+                "title": title,
+                "url": full_url,
+                "author": author_el.get_text(strip=True) if author_el else "未知",
+                "latest": latest_el.get_text(strip=True) if latest_el else "未知",
+                "_site": site,
+            })
+        if novels:
+            break
+    return novels
+
+
+def _search_from_site(site: SiteConfig, keyword: str) -> list[dict]:
+    scraper = make_session()
+    base = _warm_up(scraper, site)
+    scraper.headers["Referer"] = base + "/"
+    search_url = base + site.search_path
+
+    try:
+        if site.search_method.upper() == "POST":
+            resp = scraper.post(
+                search_url,
+                data={site.search_param: keyword, "submit": ""},
+                timeout=30,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            _sleep()
+        else:
+            resp = _fetch(scraper, f"{search_url}?{site.search_param}={keyword}")
+    except Exception as exc:
+        logger.warning("[%s] search primary failed (%s), trying GET fallback", site.name, exc)
+        resp = _fetch(scraper, f"{search_url}?{site.search_param}={keyword}")
+
+    html = _decode(resp)
+    soup = BeautifulSoup(html, "lxml")
+    return _parse_search(soup, site, base)
+
+
+def search_novels(keyword: str) -> list[dict]:
+    errors: list[str] = []
+    for site in SITES:
+        try:
+            results = _search_from_site(site, keyword)
+            if results:
+                return results
+        except Exception as exc:
+            errors.append(f"{site.name}: {exc}")
+    raise RuntimeError("所有站台均無法搜尋。\n" + "\n".join(errors))
+
+
+# ---------------------------------------------------------------------------
+# Book info + chapter list
+# ---------------------------------------------------------------------------
+
+def _detect_site(book_url: str) -> SiteConfig:
+    for site in SITES:
+        domain = urlparse(site.base_url).netloc.replace("www.", "")
+        if domain in book_url:
+            return site
+    return SITES[0]
+
+
+def get_book_info(book_url: str) -> dict:
+    site = _detect_site(book_url)
+    scraper = make_session()
+    base = _warm_up(scraper, site)
+
+    if not book_url.startswith("http"):
+        book_url = base + book_url
+
+    scraper.headers["Referer"] = base + "/"
+    resp = _fetch(scraper, book_url)
+    html = _decode(resp)
+    soup = BeautifulSoup(html, "lxml")
+
+    title_el = soup.select_one("h1, .booktitle, .book-title, #bookinfo h1, .book-info h1")
+    title = title_el.get_text(strip=True) if title_el else "未知"
+    chapters = _extract_chapters(soup, site, book_url)
+
+    if not chapters:
+        for suffix in ("/catalog/", "/list/", "/index.html"):
+            catalog_url = book_url.rstrip("/") + suffix
+            try:
+                resp2 = _fetch(scraper, catalog_url)
+                soup2 = BeautifulSoup(_decode(resp2), "lxml")
+                chapters = _extract_chapters(soup2, site, book_url)
+                if chapters:
+                    break
+            except Exception as exc:
+                logger.warning("[%s] catalog page failed: %s", site.name, exc)
+
+    return {"title": title, "chapters": chapters}
+
+
+def _extract_chapters(soup: BeautifulSoup, site: SiteConfig, base_url: str) -> list[dict]:
+    chapters: list[dict] = []
+    parsed_base = urlparse(base_url)
+    origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    for sel in site.chapter_list_sels:
+        els = soup.select(sel)
+        if not els:
+            continue
+        for el in els:
+            href = el.get("href", "")
+            ch_title = el.get_text(strip=True)
+            if href and ch_title and len(ch_title) > 1:
+                full_url = href if href.startswith("http") else urljoin(origin, href)
+                chapters.append({"title": ch_title, "url": full_url})
+        break
+    return chapters
+
+
+# ---------------------------------------------------------------------------
+# Chapter content
+# ---------------------------------------------------------------------------
+
+def get_chapter_content(
+    chapter_url: str,
+    session: Optional[cloudscraper.CloudScraper] = None,
+) -> tuple[str, str]:
+    if session is None:
+        session = make_session()
+        site = _detect_site(chapter_url)
+        _warm_up(session, site)
+
+    parsed = urlparse(chapter_url)
+    parent_path = parsed.path.rsplit("/", 1)[0] + "/"
+    session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
+
+    resp = _fetch(session, chapter_url)
+    html = _decode(resp)
+    soup = BeautifulSoup(html, "lxml")
+
+    title_el = soup.select_one("h1, .chapter-title, #bookname, .readtitle")
+    chapter_title = title_el.get_text(strip=True) if title_el else ""
+
+    site = _detect_site(chapter_url)
+    content_div = None
+    for sel in site.content_sels:
+        content_div = soup.select_one(sel)
+        if content_div:
+            break
+
+    if not content_div:
+        return chapter_title, ""
+
+    for tag in content_div.select("script, style, .ad, .ads, .adsbygoogle, ins, iframe, a"):
+        tag.decompose()
+
+    raw = content_div.get_text("\n")
+    cleaned: list[str] = []
+    prev = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or _SKIP_RE.search(line):
+            continue
+        if line == prev:
+            continue
+        cleaned.append(line)
+        prev = line
+
+    return chapter_title, "\n".join(cleaned)
+
+----------------------------------------------------------------
+【檔案 3/4】bot.py
+----------------------------------------------------------------
+
+"""
+bot.py — Novel Finder Telegram Bot
+架構：python-telegram-bot v20.7，全 async，ConversationHandler，long-polling
+執行時間由 BOT_LIFETIME_SECONDS 環境變數控制（預設 1200 秒）
+"""
+
+import asyncio
+import logging
+import os
+
+from telegram import Update
+from telegram.error import TelegramError
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from downloader import download_novel
+from scraper import CATEGORY_MAP, get_book_info, get_hot_list, search_novels
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN: str = os.environ["TELEGRAM_TOKEN"]
+BOT_LIFETIME: int = int(os.environ.get("BOT_LIFETIME_SECONDS", "1200"))
+
+IDLE = 0
+WAIT_BOOK_CHOICE = 1
+
+SUPPORTED_CATEGORIES = "、".join(CATEGORY_MAP.keys())
+
+
+def _help_text() -> str:
+    return (
+        "📚 *小說搜尋下載器*\n\n"
+        "*使用方式：*\n"
+        "• 傳送書名關鍵字 → 搜尋小說\n"
+        "• `hot` 或 `/hot` → 綜合熱門 Top 20\n"
+        "• `/hot 玄幻` → 指定分類熱門榜\n"
+        "• `/cancel` → 取消當前操作\n\n"
+        f"*支援分類：*{SUPPORTED_CATEGORIES}"
+    )
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(_help_text(), parse_mode="Markdown")
+    return IDLE
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(_help_text(), parse_mode="Markdown")
+    return IDLE
+
+
+async def cmd_hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    category = " ".join(context.args).strip() if context.args else None
+    return await _do_hot(update, category)
+
+
+async def msg_hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    parts = text.split(None, 1)
+    category = parts[1].strip() if len(parts) > 1 else None
+    return await _do_hot(update, category)
+
+
+async def _do_hot(update: Update, category: str | None) -> int:
+    cat_display = category if category else "綜合"
+    await update.message.reply_text(f"⏳ 正在獲取「{cat_display}」熱門榜，請稍候...")
+
+    try:
+        novels = await asyncio.wait_for(
+            asyncio.to_thread(get_hot_list, category),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ 所有站台均無回應（已等待 45 秒），請稍後再試。")
+        return IDLE
+    except Exception as exc:
+        logger.exception("Hot list error")
+        await update.message.reply_text(f"❌ 獲取失敗：{str(exc)[:300]}")
+        return IDLE
+
+    if not novels:
+        await update.message.reply_text("❌ 暫時無法獲取榜單，請稍後再試。")
+        return IDLE
+
+    lines = [f"🔥 *{cat_display}熱門排行 Top {len(novels)}*\n"]
+    for n in novels:
+        lines.append(f"`{n['rank']:2}.` {n['title']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return IDLE
+
+
+async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyword = update.message.text.strip()
+    if not keyword:
+        await update.message.reply_text("請輸入書名關鍵字。")
+        return IDLE
+
+    await update.message.reply_text(f"🔍 正在搜尋「{keyword}」，請稍候...")
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(search_novels, keyword),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ 所有站台均無回應（已等待 45 秒），請稍後再試。")
+        return IDLE
+    except Exception as exc:
+        logger.exception("Search error")
+        await update.message.reply_text(f"❌ 搜尋失敗：{str(exc)[:300]}")
+        return IDLE
+
+    if not results:
+        await update.message.reply_text("❌ 找不到相關小說，請換個關鍵字再試。")
+        return IDLE
+
+    context.user_data["search_results"] = results
+
+    lines = [f"📖 *搜尋結果（共 {len(results)} 本）*\n傳送編號選擇書籍：\n"]
+    for i, n in enumerate(results, 1):
+        line = f"`{i}.` 《{n['title']}》"
+        if n.get("author") and n["author"] != "未知":
+            line += f" — {n['author']}"
+        if n.get("latest") and n["latest"] != "未知":
+            line += f"\n    最新：{n['latest']}"
+        lines.append(line)
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return WAIT_BOOK_CHOICE
+
+
+async def msg_choose_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+
+    if not text.isdigit():
+        await update.message.reply_text(
+            "請輸入搜尋結果的*編號*，或 /cancel 取消，或直接輸入新的書名重新搜尋。",
+            parse_mode="Markdown",
+        )
+        return WAIT_BOOK_CHOICE
+
+    choice = int(text)
+    results: list[dict] = context.user_data.get("search_results", [])
+
+    if not results:
+        await update.message.reply_text("搜尋結果已過期，請重新輸入書名。")
+        return IDLE
+
+    if choice < 1 or choice > len(results):
+        await update.message.reply_text(f"請輸入 1 到 {len(results)} 之間的編號。")
+        return WAIT_BOOK_CHOICE
+
+    selected = results[choice - 1]
+    book_url = selected["url"]
+    book_title = selected["title"]
+
+    await update.message.reply_text(f"✅ 已選擇《{book_title}》\n⏳ 正在獲取章節列表，請稍候...")
+
+    try:
+        book_info = await asyncio.wait_for(
+            asyncio.to_thread(get_book_info, book_url),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ 獲取章節列表超時（45 秒），請稍後再試。")
+        return IDLE
+    except Exception as exc:
+        logger.exception("get_book_info error")
+        await update.message.reply_text(f"❌ 獲取章節列表失敗：{str(exc)[:300]}")
+        return IDLE
+
+    chapters = book_info.get("chapters", [])
+    if not chapters:
+        await update.message.reply_text(
+            "❌ 無法獲取章節列表，可能是網站結構問題。\n請稍後再試或換一本書。"
+        )
+        return IDLE
+
+    await update.message.reply_text(
+        f"📚 共找到 *{len(chapters)}* 章\n⏳ 開始下載，每 20 章回報一次進度……",
+        parse_mode="Markdown",
+    )
+
+    async def progress_cb(current: int, total: int) -> None:
+        pct = current * 100 // total
+        try:
+            await update.message.reply_text(f"⬇️ 下載進度：{current}/{total}（{pct}%）")
+        except TelegramError:
+            pass
+
+    try:
+        file_paths = await download_novel(book_title, chapters, progress_cb)
+    except Exception as exc:
+        logger.exception("download_novel error")
+        await update.message.reply_text(f"❌ 下載失敗：{str(exc)[:200]}")
+        return IDLE
+
+    total_parts = len(file_paths)
+    for i, path in enumerate(file_paths, 1):
+        part_label = f" Part {i}/{total_parts}" if total_parts > 1 else ""
+        caption = f"《{book_title}》{part_label}｜共 {len(chapters)} 章"
+        try:
+            await update.message.reply_text(f"📤 正在傳送《{book_title}》{part_label}…")
+            with open(path, "rb") as fh:
+                await update.message.reply_document(
+                    document=fh,
+                    filename=os.path.basename(path),
+                    caption=caption,
+                )
+        except TelegramError as exc:
+            logger.error("Send file error: %s", exc)
+            await update.message.reply_text(f"❌ 傳送檔案失敗：{exc}")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    await update.message.reply_text(f"✅ 《{book_title}》下載完成！可再傳送書名繼續搜尋。")
+    return IDLE
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("✅ 已取消。可重新傳送書名搜尋。")
+    return IDLE
+
+
+def build_app():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    hot_filter = filters.Regex(r"(?i)^hot(\s|$)")
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CommandHandler("help", cmd_help),
+            CommandHandler("hot", cmd_hot),
+            MessageHandler(hot_filter, msg_hot),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, msg_search),
+        ],
+        states={
+            IDLE: [
+                CommandHandler("hot", cmd_hot),
+                MessageHandler(hot_filter, msg_hot),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_search),
+            ],
+            WAIT_BOOK_CHOICE: [
+                MessageHandler(filters.Regex(r"^\d+$"), msg_choose_book),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~hot_filter, msg_choose_book),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("start", cmd_start),
+            CommandHandler("help", cmd_help),
+        ],
+        allow_reentry=True,
+        name="novel_conv",
+        persistent=False,
+    )
+
+    app.add_handler(conv)
+    return app
+
+
+async def run() -> None:
+    app = build_app()
+    logger.info("Initializing bot (lifetime=%ds)...", BOT_LIFETIME)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
+    logger.info("Bot is running. Will stop after %d seconds.", BOT_LIFETIME)
+    await asyncio.sleep(BOT_LIFETIME)
+    logger.info("Lifetime reached — shutting down gracefully.")
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+    logger.info("Bot stopped.")
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
+
+----------------------------------------------------------------
+【檔案 4/4】downloader.py
+----------------------------------------------------------------
+
+"""
+downloader.py — 小說章節下載、內容合併、TXT 產製與分割
+"""
+
+import asyncio
+import logging
+import os
+import re
+from collections.abc import Awaitable, Callable
+from typing import Optional
+
+from scraper import get_chapter_content, make_session
+
+logger = logging.getLogger(__name__)
+
+MAX_FILE_SIZE = 45 * 1024 * 1024  # 45 MB
+
+ProgressCallback = Optional[Callable[[int, int], Awaitable[None]]]
+
+
+async def download_novel(
+    book_title: str,
+    chapters: list[dict],
+    progress_callback: ProgressCallback = None,
+) -> list[str]:
+    """
+    下載所有章節，合併成 TXT 檔。
+    若超過 45 MB 則自動切分多個 Part。
+    返回本機暫存檔案路徑清單（呼叫方需自行刪除）。
+    """
+    session = make_session()
+    total = len(chapters)
+    parts_text: list[str] = []
+
+    header = f"{book_title}\n{'=' * 60}\n\n"
+    parts_text.append(header)
+
+    for idx, chapter in enumerate(chapters, 1):
+        if progress_callback and idx % 20 == 0:
+            try:
+                await progress_callback(idx, total)
+            except Exception as cb_exc:
+                logger.warning("Progress callback error: %s", cb_exc)
+
+        try:
+            chapter_title, content = await asyncio.to_thread(
+                get_chapter_content, chapter["url"], session
+            )
+        except Exception as exc:
+            logger.error("Chapter %d/%d failed (%s): %s", idx, total, chapter.get("url", ""), exc)
+            chapter_title = chapter.get("title", f"第{idx}章")
+            content = "[本章下載失敗]"
+
+        if not chapter_title:
+            chapter_title = chapter.get("title", f"第{idx}章")
+
+        block = f"\n\n{'─' * 40}\n{chapter_title}\n{'─' * 40}\n\n{content}\n"
+        parts_text.append(block)
+
+    full_text = "".join(parts_text)
+    encoded = full_text.encode("utf-8")
+    safe_title = _sanitize(book_title)
+
+    if len(encoded) <= MAX_FILE_SIZE:
+        path = f"/tmp/{safe_title}.txt"
+        _write_bytes(path, encoded)
+        return [path]
+
+    file_paths: list[str] = []
+    offset = 0
+    part_num = 1
+
+    while offset < len(encoded):
+        chunk = encoded[offset : offset + MAX_FILE_SIZE]
+        if len(chunk) == MAX_FILE_SIZE and offset + MAX_FILE_SIZE < len(encoded):
+            last_nl = chunk.rfind(b"\n")
+            if last_nl > MAX_FILE_SIZE // 2:
+                chunk = chunk[: last_nl + 1]
+        path = f"/tmp/{safe_title}_Part{part_num}.txt"
+        _write_bytes(path, chunk)
+        file_paths.append(path)
+        offset += len(chunk)
+        part_num += 1
+
+    return file_paths
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
+def _sanitize(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    return name[:80]
+
+================================================================
+四、實際錯誤記錄（截圖內容）
+================================================================
+
+【測試時間：2026-03-14】
+
+錯誤訊息 1（加 timeout 前）：
+  ❌ 搜尋失敗：所有站台均無法搜尋，請稍後再試。
+  69書吧: 403 Client Error: Forbidden for url:
+    https://www.69shuba.com/search.php?searchkey=%E4%BF%AE%E7%9C%9F%E4%B8%96%E7%95%8C
+  飄天文學: 404 Client Error: Not Found for url: https://www.piaotian.xxx/...
+
+錯誤訊息 2（加 45 秒 timeout 後，現狀）：
+  ❌ 所有站台均無回應（已等待 45 秒），請稍後再試。
+
+================================================================
+五、問題分析
+================================================================
+
+【根本原因】
+GitHub Actions 使用 Microsoft Azure 美國資料中心的 IP 位址。
+所有主要中文小說網站（69shuba、ptwxz、uukanshu、xbiquge 等）均透過
+Cloudflare WAF 或自行封鎖數據中心 IP，視其為惡意爬蟲/機器人。
+結果：warm-up 請求本身也返回 403，完全無法建立 session。
+
+【已確認無效的方法】
+1. cloudscraper（繞過 Cloudflare JS Challenge）→ IP 層級被封，JS 繞過無效
+2. 偽裝 Chrome/Windows User-Agent → 無效，IP 本身被封
+3. warm-up 先訪問首頁取得 Cookie → 首頁也被封
+4. 增加備援站台（從 4 個增至 6 個）→ 全部相同，都被封
+5. 減少 timeout（8s）→ 失敗更快，但根本問題未解
+
+【已修復的次要問題】
+- ptwxz.com 跨域重定向造成 404：已修正 warm_up 不使用重定向後的域名建構 URL
+- Bot 掛死 46 分鐘：已加 asyncio.wait_for(timeout=45) 強制上限
+
+================================================================
+六、希望得到的協助
+================================================================
+
+【問題 A】如何讓 GitHub Actions 能訪問中文小說站台？
+
+可能方向（請評估可行性與免費方案）：
+- Cloudflare Workers 作為代理中繼
+  （CF 自己的 IP 不被 CF WAF 封鎖，理論上可行）
+- 免費的 residential proxy 服務整合
+- Tor exit node（免費但速度慢）
+- 其他不封鎖 GitHub Actions IP 的中文小說站台（是否有 API 或 RSS？）
+
+【問題 B】完全不同的免費替代架構
+
+如果 GitHub Actions 無法作為爬蟲執行環境，
+請提供一個完全免費的替代方案，需符合以下條件：
+- 永久免費（無隱藏費用）
+- 能訪問中文小說站台（IP 不被封）
+- 能長時間執行（2000 章小說下載需 30~60 分鐘）
+- 能發送最大 50MB 的 Telegram 文件
+
+已評估但有問題的平台：
+- Render.com：閒置 15 分後睡眠；IP 未知是否被封
+- PythonAnywhere：免費版對外 HTTP 請求有白名單，無法連中文站
+- Replit：免費版會睡眠且速度慢
+- Railway / Fly.io：已移除免費方案
+
+【問題 C】爬蟲以外的替代數據源
+
+- 是否有開放的中文小說 Public API？
+- lightnovel-crawler（GitHub 開源工具，支援 460+ 站台）是否有 API/服務模式？
+- 其他可從台灣正常訪問且不需要爬蟲的小說資源？
+
+【問題 D】整個架構重設計
+
+若需要，請根據以上約束條件提出全新架構設計，包含：
+1. 各元件的職責分配
+2. 技術選型與平台選擇
+3. 資料流程圖
+4. 預估費用（目標：完全免費）
+5. 部署步驟
+
+================================================================
+七、補充資訊
+================================================================
+
+- 使用者在台灣，個人私用（非商業、非大規模爬取）
+- 最高優先：完全免費
+- 次要優先：架構簡單、容易維護
+- 可接受的功能降級：
+  搜尋/熱門榜改為只顯示連結不下載也可以，
+  只要能讓使用者收到 TXT 檔案即可
+
+================================================================
+（文件結束）
+================================================================
