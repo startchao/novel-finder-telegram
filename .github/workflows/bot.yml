@@ -8,9 +8,9 @@ on:
         required: false
         default: "1200"
         type: string
-  # schedule 已停用：Bot 已遷移至 Render.com webhook 模式，cron polling 不再需要
-  # schedule:
-  #   - cron: "*/15 * * * *"
+  # 每 15 分鐘自動接班一次（GitHub Actions runner 單次最多 20 分鐘）
+  schedule:
+    - cron: "*/15 * * * *"
 
 concurrency:
   group: novel-bot
