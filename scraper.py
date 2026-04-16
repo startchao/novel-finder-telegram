@@ -68,6 +68,25 @@ class SiteConfig:
     chapter_list_sels: list[str]   # 章節列表 a 選擇器
     content_sels: list[str]        # 章節內文容器選擇器
     encoding: str = "utf-8"
+    # 書籍詳情頁選擇器（description/author/cover/status）
+    detail_title_sels: list[str] = field(default_factory=lambda: [
+        "h1", ".booktitle", ".book-title", "#bookinfo h1", ".book-info h1", "meta[property='og:title']",
+    ])
+    detail_author_sels: list[str] = field(default_factory=lambda: [
+        ".author", ".writer", "#info p:nth-of-type(1)", ".book-info .author",
+        "meta[property='og:novel:author']", "meta[name='author']",
+    ])
+    detail_desc_sels: list[str] = field(default_factory=lambda: [
+        "#intro", ".intro", "#introduction", ".introduction",
+        "#book-intro", ".book-intro", ".bookintro", ".desc", ".description",
+        "meta[property='og:description']", "meta[name='description']",
+    ])
+    detail_cover_sels: list[str] = field(default_factory=lambda: [
+        "meta[property='og:image']", ".cover img", "#fmimg img", ".book-cover img",
+    ])
+    detail_status_sels: list[str] = field(default_factory=lambda: [
+        ".status", ".book-status", "meta[property='og:novel:status']",
+    ])
 
 
 SITE_69SHUBA = SiteConfig(
@@ -210,6 +229,64 @@ _NAV_TITLES = {
     "首頁", "首页", "排行", "書架", "书架", "登入", "登录",
     "注冊", "注册", "搜索", "搜尋", "分類", "分类",
 }
+
+# 狀態 / 標籤字，出現在 <a> 裡時不應被誤當成書名
+_STATUS_WORDS = {
+    "已完本", "完本", "完結", "完结", "連載中", "连载中", "連載", "连载",
+    "未完", "新書", "新书", "熱門", "热门", "推薦", "推荐", "置頂", "置顶",
+    "VIP", "免費", "免费",
+}
+
+
+def _extract_title(item, link) -> str:
+    """
+    從搜尋/熱門項目中取出書名。
+    避免 <a> 文字被狀態字（已完本 / 連載中 等）覆蓋的情況。
+    依序嘗試：a[title] → link.text → item 子節點 .bookname/.title/h3/h4/dt。
+    """
+    candidates = [
+        (link.get("title") or "").strip(),
+        link.get_text(strip=True) if link else "",
+    ]
+    for cand in candidates:
+        if cand and cand not in _STATUS_WORDS and cand not in _NAV_TITLES and len(cand) >= 2:
+            return cand
+    for sel in (".bookname", ".title", "h3", "h4", "dt", "h2"):
+        el = item.select_one(sel)
+        if not el:
+            continue
+        txt = el.get_text(strip=True)
+        if txt and txt not in _STATUS_WORDS and txt not in _NAV_TITLES and len(txt) >= 2:
+            return txt
+    return ""
+
+
+def _meta_or_text(soup, selectors: list[str]) -> str:
+    """對選擇器依序取值：若是 meta[... content=...] 取 content，否則取 text。"""
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        if el.name == "meta":
+            val = (el.get("content") or "").strip()
+        else:
+            val = el.get_text(" ", strip=True)
+        if val:
+            return val
+    return ""
+
+
+def _first_attr(soup, selectors: list[str], attrs: tuple[str, ...]) -> str:
+    """對選擇器依序取屬性（如 src / content / data-src），回傳第一個非空。"""
+    for sel in selectors:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        for a in attrs:
+            val = (el.get(a) or "").strip()
+            if val:
+                return val
+    return ""
 
 # ---------------------------------------------------------------------------
 # Session / HTTP helpers
@@ -376,11 +453,17 @@ def _parse_hot(soup: BeautifulSoup, site: SiteConfig, base: str) -> list[dict]:
             continue
         logger.info("[%s] hot selector '%s' → %d items", site.name, sel, len(items))
         for item in items:
-            link = item.select_one("a")
+            link = item.select_one("a[href]")
             if not link:
                 continue
-            title = link.get_text(strip=True)
-            if len(title) < 2 or title in _NAV_TITLES:
+            # 若命中的 <a> 內文是狀態字（「已完本」等），嘗試找真正指向書頁的連結
+            if link.get_text(strip=True) in _STATUS_WORDS:
+                for a in item.select("a[href]"):
+                    if a.get_text(strip=True) not in _STATUS_WORDS:
+                        link = a
+                        break
+            title = _extract_title(item, link)
+            if not title:
                 continue
             href = link.get("href", "")
             full_url = href if href.startswith("http") else urljoin(base, href)
@@ -454,8 +537,8 @@ def _parse_search(soup: BeautifulSoup, site: SiteConfig, base: str) -> list[dict
                     break
             if not title_el:
                 continue
-            title = title_el.get_text(strip=True)
-            if len(title) < 2:
+            title = _extract_title(item, title_el)
+            if not title:
                 continue
             href = title_el.get("href", "")
             full_url = href if href.startswith("http") else urljoin(base, href)
@@ -541,7 +624,9 @@ def _detect_site(book_url: str) -> SiteConfig:
 
 
 def get_book_info(book_url: str) -> dict:
-    """返回 {'title': str, 'chapters': [{'title': str, 'url': str}]}"""
+    """
+    返回 {'title', 'author', 'description', 'cover_url', 'status', 'chapters'[{title,url}]}
+    """
     site = _detect_site(book_url)
     scraper = make_session()
     base = _warm_up(scraper, site)
@@ -556,8 +641,20 @@ def get_book_info(book_url: str) -> dict:
     html = _decode(resp)
     soup = BeautifulSoup(html, "lxml")
 
-    title_el = soup.select_one("h1, .booktitle, .book-title, #bookinfo h1, .book-info h1")
-    title = title_el.get_text(strip=True) if title_el else "未知"
+    title = _meta_or_text(soup, site.detail_title_sels) or "未知"
+    author = _meta_or_text(soup, site.detail_author_sels) or "未知"
+    # 作者欄常見前綴「作者：」清掉
+    author = re.sub(r"^(作\s*者[:：]?\s*)", "", author).strip() or "未知"
+
+    description = _meta_or_text(soup, site.detail_desc_sels) or ""
+    # 清理簡介中常見的 HTML 破碎殘留
+    description = re.sub(r"\s+", " ", description).strip()
+
+    cover_url = _first_attr(soup, site.detail_cover_sels, ("src", "data-src", "data-original", "content"))
+    if cover_url and not cover_url.startswith("http"):
+        cover_url = urljoin(book_url, cover_url)
+
+    status = _meta_or_text(soup, site.detail_status_sels) or ""
 
     chapters = _extract_chapters(soup, site, book_url)
 
@@ -575,7 +672,14 @@ def get_book_info(book_url: str) -> dict:
                 logger.warning("[%s] catalog page failed: %s", site.name, exc)
 
     logger.info("[%s] book '%s': %d chapters", site.name, title, len(chapters))
-    return {"title": title, "chapters": chapters}
+    return {
+        "title": title,
+        "author": author,
+        "description": description,
+        "cover_url": cover_url,
+        "status": status,
+        "chapters": chapters,
+    }
 
 
 def _extract_chapters(soup: BeautifulSoup, site: SiteConfig, base_url: str) -> list[dict]:
