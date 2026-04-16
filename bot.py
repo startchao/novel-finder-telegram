@@ -19,7 +19,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from aiohttp import web
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -58,8 +57,7 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN: str = os.environ["TELEGRAM_TOKEN"]
-WEBHOOK_URL: str = os.environ["WEBHOOK_URL"]
-PORT: int = int(os.environ.get("PORT", "8443"))
+BOT_LIFETIME_SECONDS: int = int(os.environ.get("BOT_LIFETIME_SECONDS", "1200"))
 
 MAX_PER_USER_TASKS = 3
 SEARCH_RESULT_TTL = 30 * 60  # 搜尋結果保留 30 分鐘
@@ -550,56 +548,41 @@ def build_app():
 
 
 # ---------------------------------------------------------------------------
-# Webhook + Health server
+# Polling runner（GitHub Actions 模式：每輪跑 BOT_LIFETIME_SECONDS 後退出）
 # ---------------------------------------------------------------------------
-
-async def _build_web_app(bot_app) -> web.Application:
-    web_app = web.Application()
-
-    async def telegram_handler(request: web.Request) -> web.Response:
-        data = await request.json()
-        update = Update.de_json(data, bot_app.bot)
-        await bot_app.process_update(update)
-        return web.Response(text="OK")
-
-    async def health_handler(request: web.Request) -> web.Response:
-        return web.Response(text="OK")
-
-    web_app.router.add_post("/telegram", telegram_handler)
-    web_app.router.add_get("/health", health_handler)
-    web_app.router.add_get("/", health_handler)
-    return web_app
-
 
 async def run() -> None:
     bot_app = build_app()
 
-    logger.info("Initializing bot (webhook mode)...")
+    logger.info("Initializing bot (polling mode, lifetime=%ds)...", BOT_LIFETIME_SECONDS)
     await bot_app.initialize()
+
+    # 清除舊 webhook，確保 polling 模式不會衝突
+    try:
+        await bot_app.bot.delete_webhook(drop_pending_updates=True)
+    except TelegramError as exc:
+        logger.warning("delete_webhook failed: %s", exc)
+
     await bot_app.start()
-
-    webhook_path = f"{WEBHOOK_URL}/telegram"
-    await bot_app.bot.set_webhook(
-        url=webhook_path,
+    await bot_app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
-    logger.info("Webhook registered: %s", webhook_path)
-
-    web_app = await _build_web_app(bot_app)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info("Web server listening on 0.0.0.0:%d", PORT)
+    logger.info("Polling started.")
 
     try:
-        await asyncio.Event().wait()
+        await asyncio.sleep(BOT_LIFETIME_SECONDS)
     finally:
-        logger.info("Shutting down...")
-        await runner.cleanup()
-        await bot_app.stop()
-        await bot_app.shutdown()
+        logger.info("Lifetime reached, shutting down polling...")
+        try:
+            await bot_app.updater.stop()
+        except Exception:
+            logger.exception("updater.stop failed")
+        try:
+            await bot_app.stop()
+        finally:
+            await bot_app.shutdown()
+        logger.info("Bye.")
 
 
 if __name__ == "__main__":
