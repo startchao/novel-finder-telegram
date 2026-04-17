@@ -37,5 +37,6 @@ jobs:
       - name: Run Novel Finder Bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          PROXY_BASE: ${{ secrets.PROXY_BASE }}
           BOT_LIFETIME_SECONDS: ${{ github.event.inputs.lifetime_seconds || '1200' }}   # 排程觸發也用 1200 秒
         run: python bot.py
