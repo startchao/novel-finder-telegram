@@ -9,14 +9,25 @@ crawlers — 多站台爬蟲模組
 - registry: 統一註冊表，提供 search_all / detect
 """
 from .base import BaseCrawler, SearchResult, BookInfo
-from .registry import CRAWLERS, search_all, detect_crawler, get_book_info
+from .registry import (
+    ALL_SOURCES,
+    CRAWLERS,
+    detect_crawler,
+    get_book_info,
+    get_crawler_by_name,
+    list_sources,
+    search_all,
+)
 
 __all__ = [
+    "ALL_SOURCES",
     "BaseCrawler",
     "SearchResult",
     "BookInfo",
     "CRAWLERS",
-    "search_all",
     "detect_crawler",
     "get_book_info",
+    "get_crawler_by_name",
+    "list_sources",
+    "search_all",
 ]

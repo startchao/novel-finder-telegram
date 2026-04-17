@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 # through the proxy instead of directly. Falls back to direct if not set.
 PROXY_BASE: str = os.environ.get("PROXY_BASE", "").rstrip("/")
 
+# 這些 domain 不走 proxy（台灣站直連比 proxy 快且穩）
+NO_PROXY_HOSTS: tuple[str, ...] = ("czbooks.net",)
+
+
+def _should_bypass_proxy(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return any(host.endswith(h) for h in NO_PROXY_HOSTS)
+
 # ---------------------------------------------------------------------------
 # 共用分類對照表（用於 bot.py 顯示支援清單）
 # ---------------------------------------------------------------------------
@@ -366,7 +377,7 @@ def _fetch(scraper, url: str, method: str = "GET", max_retries: int = 2, **kwarg
     last_exc: Exception = RuntimeError(f"Failed: {url}")
     for attempt in range(max_retries):
         try:
-            if PROXY_BASE:
+            if PROXY_BASE and not _should_bypass_proxy(url):
                 resp = _fetch_via_proxy(scraper, url, method, **kwargs)
             elif method.upper() == "POST":
                 resp = scraper.post(url, timeout=8, **kwargs)
