@@ -36,9 +36,11 @@ from telegram.ext import (
 )
 
 from crawlers import (
+    ALL_SOURCES,
     BookInfo,
     SearchResult,
     detect_crawler,
+    list_sources,
     search_all,
 )
 from crawlers.base import BaseCrawler
@@ -63,6 +65,22 @@ MAX_PER_USER_TASKS = 3
 SEARCH_RESULT_TTL = 30 * 60  # 搜尋結果保留 30 分鐘
 BOOK_INFO_TTL = 30 * 60
 
+DEFAULT_SOURCE = "小說狂人"  # 台灣站、直連穩定，作為預設
+
+# 來源選單（顯示順序；name 需與 crawler.name 對應，或等於 ALL_SOURCES）
+SOURCE_MENU: list[str] = [
+    "小說狂人",     # czbooks（台灣，最穩）
+    "知軒藏書",     # zxcs 預打包 txt
+    "筆趣閣",       # biquge 多鏡像
+    "番茄小說",     # fanqie API
+    "69書吧",       # 69shuba
+    "飄天文學",
+    "UU看書",
+    "新笔趣阁",
+    "23小時",
+    ALL_SOURCES,
+]
+
 SUPPORTED_CATEGORIES = "、".join(CATEGORY_MAP.keys())
 
 
@@ -70,7 +88,8 @@ def _help_text() -> str:
     return (
         "📚 *小說搜尋下載器*\n\n"
         "*使用方式：*\n"
-        "• 傳送書名關鍵字 → 多站同時搜尋\n"
+        "• 傳送書名關鍵字 → 搜尋目前指定來源\n"
+        "• `/source` → 切換搜尋來源（預設：小說狂人）\n"
         "• 點擊搜尋結果按鈕 → 查看介紹與封面\n"
         "• `/hot` 或 `hot` → 綜合熱門 Top 20\n"
         "• `/hot 玄幻` → 指定分類熱門榜\n"
@@ -79,6 +98,28 @@ def _help_text() -> str:
         f"*支援分類：*{SUPPORTED_CATEGORIES}\n"
         "*支援站台：*知軒藏書、筆趣閣系列、番茄小說、69書吧、飄天、UU看書、新笔趣阁、小說狂人、23小時"
     )
+
+
+def _get_source(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("source", DEFAULT_SOURCE)
+
+
+def _set_source(context: ContextTypes.DEFAULT_TYPE, source: str) -> None:
+    context.user_data["source"] = source
+
+
+def _source_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for name in SOURCE_MENU:
+        label = f"✅ {name}" if name == current else name
+        row.append(InlineKeyboardButton(label, callback_data=f"src:{name}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +205,55 @@ def _gc_user_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_help_text(), parse_mode=ParseMode.MARKDOWN)
+    # 首次使用：設定預設來源
+    if "source" not in context.user_data:
+        _set_source(context, DEFAULT_SOURCE)
+    current = _get_source(context)
+    text = (
+        f"{_help_text()}\n\n"
+        f"📡 *目前搜尋來源：{current}*\n"
+        f"點下方按鈕可切換："
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_source_keyboard(current),
+    )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_help_text(), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = _get_source(context)
+    await update.message.reply_text(
+        f"📡 *目前搜尋來源：{current}*\n\n選一個站台後，輸入書名即可搜尋：",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_source_keyboard(current),
+    )
+
+
+async def cb_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _, name = query.data.split(":", 1)
+    except Exception:
+        await query.answer("無效選項", show_alert=False)
+        return
+    if name not in SOURCE_MENU:
+        await query.answer("未知站台", show_alert=False)
+        return
+    _set_source(context, name)
+    await query.answer(f"已切換至 {name}")
+    try:
+        await query.edit_message_reply_markup(reply_markup=_source_keyboard(name))
+    except TelegramError:
+        pass
+    await query.message.reply_text(
+        f"✅ 來源已切換為 *{name}*，直接輸入書名搜尋即可。",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def cmd_hot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,12 +348,22 @@ async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not keyword:
         await update.message.reply_text("請輸入書名關鍵字。")
         return
-    await update.message.reply_text(f"🔍 正在多站搜尋「{keyword}」，請稍候...")
+
+    source = _get_source(context)
+    is_all = source == ALL_SOURCES
+    search_timeout = 25.0 if is_all else 20.0
+    await update.message.reply_text(
+        f"🔍 搜尋「{keyword}」中…（來源：{source}，/source 可切換）"
+    )
 
     try:
-        results = await asyncio.wait_for(search_all(keyword), timeout=60.0)
+        results = await asyncio.wait_for(
+            search_all(keyword, source=source), timeout=search_timeout,
+        )
     except asyncio.TimeoutError:
-        await update.message.reply_text("❌ 所有站台均無回應（已等待 60 秒）")
+        await update.message.reply_text(
+            f"❌ {source} 無回應（已等待 {int(search_timeout)} 秒）。可試 /source 切換其他站。"
+        )
         return
     except Exception as exc:
         logger.exception("search_all error")
@@ -276,7 +371,9 @@ async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not results:
-        await update.message.reply_text("❌ 找不到相關小說，請換個關鍵字再試。")
+        await update.message.reply_text(
+            f"❌ 「{source}」找不到《{keyword}》。可試 /source 切換其他站。"
+        )
         return
 
     batch_id = _put_search_results(context, results)
@@ -286,14 +383,15 @@ async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = f"📖 《{r.title}》"
         if r.author and r.author != "未知":
             label += f" — {r.author}"
-        label += f"  [{r.source}]"
+        if is_all:
+            label += f"  [{r.source}]"
         # Telegram 按鈕文字上限 64 bytes
         if len(label.encode("utf-8")) > 60:
             label = label[:28] + "…"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"b:{batch_id}:{idx}")])
 
     await update.message.reply_text(
-        f"📖 *搜尋結果（共 {len(results)} 本）* — 點按查看介紹",
+        f"📖 *搜尋結果（{len(results)} 本，來源：{source}）* — 點按查看介紹",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -534,6 +632,7 @@ def build_app():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("source", cmd_source))
     app.add_handler(CommandHandler("hot", cmd_hot))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
@@ -541,6 +640,7 @@ def build_app():
     app.add_handler(MessageHandler(hot_filter, msg_hot))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_search))
 
+    app.add_handler(CallbackQueryHandler(cb_source, pattern=r"^src:"))
     app.add_handler(CallbackQueryHandler(cb_book, pattern=r"^b:"))
     app.add_handler(CallbackQueryHandler(cb_download, pattern=r"^d:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_card, pattern=r"^x$"))
