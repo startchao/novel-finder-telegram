@@ -22,19 +22,22 @@ from .zxcs import ZxcsCrawler
 logger = logging.getLogger(__name__)
 
 
-def _build_configurable() -> list[ConfigurableCrawler]:
-    """從 scraper.SITES 取既有 6 個站台包成 ConfigurableCrawler。"""
-    from scraper import SITES
+def _czbooks_only() -> list[ConfigurableCrawler]:
+    """只包 czbooks，其餘站 selectors 已全面陳舊，暫時下架。"""
+    from scraper import SITE_CZBOOKS
 
-    return [ConfigurableCrawler(s) for s in SITES]
+    return [ConfigurableCrawler(SITE_CZBOOKS)]
 
 
+# 2026-04 搶救版：只註冊「實測可用」的兩個站，其他 crawler 類別暫不啟用。
+# 下一次迭代會把 lncrawl adapter 和其餘 crawlers 重新啟用。
 CRAWLERS: list[BaseCrawler] = [
-    ZxcsCrawler(),
-    BiqugeCrawler(),
+    *_czbooks_only(),
     FanqieCrawler(),
-    *_build_configurable(),
 ]
+
+# 保留 import 以避免 lint 警告（下一次迭代會用到）
+_UNUSED = (ZxcsCrawler, BiqugeCrawler)
 
 
 # 全站選項的標記值

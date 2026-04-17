@@ -1,18 +1,23 @@
 """
 crawlers/fanqie.py — 番茄小說（fanqienovel）
 
-番茄小說網頁版使用混淆字型，直接爬網頁文字會拿到「亂碼（反混淆表才能還原）」。
-本 crawler 走公開 reader API（社群已公布），回傳 HTML 或純文字 content。
+核心 API 與字型反混淆表參考自 github.com/ying-ck/fanqienovel-downloader
+（Apache-2.0，作者 Yck & qxqycb & lingo34），感謝他們的維護工作。
 
-若 API 行為變動（header / 簽章 / 鎖國），此 crawler 會失敗並記 log；
-使用者可透過別的站台補救。
+策略：
+  - 搜尋：api5-normal-lf.fqnovel.com 搜尋 API（JSON）
+  - 書籍頁：fanqienovel.com/page/<id> HTML 解析 h1/author/chapter list
+  - 章節內文：fanqienovel.com/api/reader/full?itemId=<cid> JSON → 再用
+    crawlers/fanqie_charset.json 把 private-use 字元還原回真正的中文
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
-from urllib.parse import urljoin
+from typing import Optional
 
 from bs4 import BeautifulSoup
 
@@ -22,30 +27,68 @@ logger = logging.getLogger(__name__)
 
 
 _WEB_BASE = "https://fanqienovel.com"
-_API_BASE = "https://api5-normal-sinfonlineb.fqnovel.com"
-_COMMON_QS = {
+_API_BASE = "https://api5-normal-lf.fqnovel.com"
+_SEARCH_PARAMS = {
     "aid": "1967",
-    "app_name": "novelapp",
-    "version_code": "999",
     "channel": "0",
+    "os_version": "0",
+    "device_type": "0",
+    "device_platform": "0",
     "iid": "466614321180296",
-    "device_id": "0",
-    "device_type": "Web",
-    "device_platform": "web",
-    "os_version": "10",
-    "version_name": "6.0.0",
+    "passback": "0",
+    "version_code": "999",
 }
 
+# 反混淆私有區間（見 ying-ck 原始碼）
+_CODE_RANGES = [(58344, 58715), (58345, 58716)]
 
-def _default_params(extra: dict) -> dict:
-    p = dict(_COMMON_QS)
-    p.update(extra)
-    return p
+_CHARSET_PATH = os.path.join(os.path.dirname(__file__), "fanqie_charset.json")
+_charset_cache: Optional[list[list[str]]] = None
+
+
+def _load_charset() -> list[list[str]]:
+    global _charset_cache
+    if _charset_cache is None:
+        try:
+            with open(_CHARSET_PATH, "r", encoding="utf-8") as f:
+                _charset_cache = json.load(f)
+        except Exception as exc:
+            logger.warning("fanqie charset load failed: %s", exc)
+            _charset_cache = [[], []]
+    return _charset_cache
+
+
+def _decode_fanqie(content: str) -> str:
+    """把 private-use 字元還原回中文。兩個 mode 各試一次，取能解較多字的版本。"""
+    if not content:
+        return ""
+    charset = _load_charset()
+    best = content
+    best_hits = 0
+    for mode in (0, 1):
+        if mode >= len(charset) or not charset[mode]:
+            continue
+        lo, hi = _CODE_RANGES[mode]
+        out: list[str] = []
+        hits = 0
+        for ch in content:
+            uni = ord(ch)
+            if lo <= uni <= hi:
+                bias = uni - lo
+                if 0 <= bias < len(charset[mode]) and charset[mode][bias] != "?":
+                    out.append(charset[mode][bias])
+                    hits += 1
+                    continue
+            out.append(ch)
+        if hits > best_hits:
+            best_hits = hits
+            best = "".join(out)
+    return best
 
 
 class FanqieCrawler(BaseCrawler):
     name = "番茄小說"
-    domain_patterns = ["fanqienovel.com", "fanqie"]
+    domain_patterns = ["fanqienovel.com", "fqnovel.com", "fanqie"]
 
     def __init__(self):
         self._session = None
@@ -68,56 +111,49 @@ class FanqieCrawler(BaseCrawler):
             )
         return self._session
 
-    def _api_get(self, path: str, params: dict) -> dict:
+    # ---- search ----------------------------------------------------------
+
+    def search(self, keyword: str) -> list[SearchResult]:
         from scraper import _fetch
         import urllib.parse
 
         session = self._get_session()
-        qs = urllib.parse.urlencode(_default_params(params))
-        url = f"{_API_BASE}{path}?{qs}"
-        resp = _fetch(session, url, max_retries=2)
-        return resp.json()
+        params = dict(_SEARCH_PARAMS)
+        params["query"] = keyword
+        qs = urllib.parse.urlencode(params)
+        url = f"{_API_BASE}/reading/bookapi/search/page/v/?{qs}"
 
-    # ---- search ----------------------------------------------------------
-
-    def search(self, keyword: str) -> list[SearchResult]:
-        """用網頁搜尋頁擷取 book_id，比 API 穩。"""
-        from scraper import _fetch, _decode
-        import urllib.parse
-
-        session = self._get_session()
         try:
-            qs = urllib.parse.urlencode({"query": keyword})
-            resp = _fetch(session, f"{_WEB_BASE}/search?{qs}", max_retries=1)
+            resp = _fetch(session, url, max_retries=2)
         except Exception as exc:
             logger.warning("[fanqie] search request failed: %s", exc)
             return []
 
-        soup = BeautifulSoup(_decode(resp), "lxml")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("[fanqie] search json parse failed: %s", exc)
+            return []
+
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            items = []
+
         results: list[SearchResult] = []
-        # 番茄搜尋結果卡片 a[href^="/page/"] 或 a[href^="/book/"]
-        seen: set[str] = set()
-        for a in soup.select("a[href*='/page/'], a[href*='/book/']"):
-            href = a.get("href", "")
-            m = re.search(r"/(?:page|book)/(\d+)", href)
-            if not m:
-                continue
-            book_id = m.group(1)
-            if book_id in seen:
-                continue
-            seen.add(book_id)
-            title = (a.get("title") or a.get_text(strip=True) or "").strip()
-            if not title or len(title) > 40:
+        for it in items[:20]:
+            book_id = str(it.get("book_id") or it.get("id") or "")
+            title = (it.get("book_name") or "").strip()
+            author = (it.get("author") or "").strip() or "未知"
+            if not book_id or not title:
                 continue
             results.append(
                 SearchResult(
                     title=title,
                     url=f"{_WEB_BASE}/page/{book_id}",
+                    author=author,
                     source=self.name,
                 )
             )
-            if len(results) >= 10:
-                break
         logger.info("[fanqie] search '%s' → %d results", keyword, len(results))
         return results
 
@@ -130,53 +166,72 @@ class FanqieCrawler(BaseCrawler):
         return m.group(1)
 
     def get_book_info(self, url: str) -> BookInfo:
+        from scraper import _fetch, _decode
+
         book_id = self._book_id(url)
-        # 目錄 API
-        try:
-            dir_data = self._api_get(
-                "/reading/bookapi/directory/all_items/v/",
-                {"book_id": book_id},
-            )
-        except Exception as exc:
-            logger.warning("[fanqie] directory api failed: %s", exc)
-            dir_data = {}
+        session = self._get_session()
 
-        # 書籍資訊 API
-        try:
-            info_data = self._api_get(
-                "/reading/bookapi/publish/detail/v/",
-                {"book_id": book_id},
-            )
-        except Exception as exc:
-            logger.warning("[fanqie] detail api failed: %s", exc)
-            info_data = {}
+        page_url = f"{_WEB_BASE}/page/{book_id}"
+        resp = _fetch(session, page_url, max_retries=2)
+        html = _decode(resp)
+        soup = BeautifulSoup(html, "lxml")
 
-        book = (info_data.get("data") or {}).get("book_info") or {}
-        title = book.get("book_name") or "未知"
-        author = book.get("author") or "未知"
-        desc = (book.get("abstract") or book.get("description") or "").strip()
-        cover = book.get("thumb_url") or book.get("audio_thumb_uri_hd") or ""
-        status_code = book.get("creation_status")
-        status = "完結" if str(status_code) == "0" else ("連載中" if status_code is not None else "")
+        # 標題 / 作者 / 狀態 / 封面 / 簡介
+        h1 = soup.select_one("h1")
+        title = h1.get_text(strip=True) if h1 else "未知"
 
-        chapters: list[dict] = []
-        items = (
-            (dir_data.get("data") or {}).get("item_data_list")
-            or (dir_data.get("data") or {}).get("all_item_ids")
-            or []
+        author = "未知"
+        # 作者多半在 ld+json
+        ld = soup.select_one('script[type="application/ld+json"]')
+        if ld and ld.string:
+            try:
+                ldd = json.loads(ld.string)
+                if isinstance(ldd, dict):
+                    authors = ldd.get("author") or []
+                    if isinstance(authors, list) and authors:
+                        author = (authors[0].get("name") or "未知").strip()
+                    elif isinstance(authors, dict):
+                        author = (authors.get("name") or "未知").strip()
+            except Exception:
+                pass
+
+        status_el = soup.select_one("span.info-label-yellow, .info-label-yellow")
+        status = status_el.get_text(strip=True) if status_el else ""
+
+        cover = ""
+        og_image = soup.select_one("meta[property='og:image']")
+        if og_image:
+            cover = (og_image.get("content") or "").strip()
+
+        desc = ""
+        og_desc = soup.select_one("meta[property='og:description']") or soup.select_one(
+            "meta[name='description']"
         )
-        # 兩種 response 格式：list[dict] 或 list[str]
-        for idx, it in enumerate(items):
-            if isinstance(it, dict):
-                cid = str(it.get("item_id") or it.get("id") or "")
-                ctitle = it.get("title") or f"第 {idx+1} 章"
-            else:
-                cid = str(it)
-                ctitle = f"第 {idx+1} 章"
-            if cid:
-                chapters.append(
-                    {"title": ctitle, "url": f"fanqie://{book_id}/{cid}"}
-                )
+        if og_desc:
+            desc = (og_desc.get("content") or "").strip()
+
+        # 章節
+        chapters: list[dict] = []
+        # 番茄頁面章節在 div.chapter 內 a 節點
+        for a in soup.select("div.chapter a[href*='/reader/']"):
+            href = a.get("href", "")
+            m = re.search(r"/reader/(\d+)", href)
+            if not m:
+                continue
+            cid = m.group(1)
+            ctitle = a.get_text(strip=True) or f"第 {len(chapters)+1} 章"
+            chapters.append({"title": ctitle, "url": f"fanqie://{book_id}/{cid}"})
+
+        # Fallback：若上面選不到，嘗試 a[href^="/reader/"]
+        if not chapters:
+            for a in soup.select("a[href^='/reader/']"):
+                href = a.get("href", "")
+                m = re.search(r"/reader/(\d+)", href)
+                if not m:
+                    continue
+                cid = m.group(1)
+                ctitle = a.get_text(strip=True) or f"第 {len(chapters)+1} 章"
+                chapters.append({"title": ctitle, "url": f"fanqie://{book_id}/{cid}"})
 
         return BookInfo(
             title=title,
@@ -192,34 +247,33 @@ class FanqieCrawler(BaseCrawler):
     # ---- download --------------------------------------------------------
 
     def _fetch_chapter(self, book_id: str, item_id: str) -> tuple[str, str]:
+        from scraper import _fetch
+
+        session = self._get_session()
+        url = f"{_WEB_BASE}/api/reader/full?itemId={item_id}"
         try:
-            data = self._api_get(
-                "/reading/reader/full/v/",
-                {"item_ids": item_id, "book_id": book_id},
-            )
+            resp = _fetch(session, url, max_retries=2)
+            data = resp.json()
         except Exception as exc:
-            logger.error("[fanqie] chapter %s failed: %s", item_id, exc)
+            logger.warning("[fanqie] chapter %s fetch failed: %s", item_id, exc)
             return f"章節 {item_id}", "[本章下載失敗]"
 
-        item = (data.get("data") or {}).get("item_content_list") or []
-        if not item:
-            # 另一種格式
-            item = (data.get("data") or {}).get("items") or []
-        if not item:
-            return f"章節 {item_id}", "[本章內容為空]"
+        cd = ((data.get("data") or {}).get("chapterData") or {})
+        title = cd.get("title") or f"章節 {item_id}"
+        raw = cd.get("content") or ""
+        if not raw:
+            return title, "[本章內容為空]"
 
-        entry = item[0]
-        title = entry.get("title") or f"章節 {item_id}"
-        raw = entry.get("content") or ""
-        # content 可能是 HTML
-        if "<" in raw:
+        # content 有時是 HTML（<p>…</p>），有時是純文字
+        if "<" in raw and ">" in raw:
             soup = BeautifulSoup(raw, "lxml")
             for t in soup.select("script, style"):
                 t.decompose()
             text = soup.get_text("\n")
         else:
             text = raw
-        # 清理多餘空白
+
+        text = _decode_fanqie(text)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         return title, "\n".join(lines)
 
@@ -243,7 +297,7 @@ class FanqieCrawler(BaseCrawler):
                 title, text = await asyncio.to_thread(self._fetch_chapter, book_id, item_id)
             async with lock:
                 done += 1
-                if progress_cb and done % 20 == 0:
+                if progress_cb and (done == total or done % 20 == 0):
                     try:
                         await progress_cb(done, total)
                     except Exception:

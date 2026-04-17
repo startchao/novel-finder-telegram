@@ -64,20 +64,15 @@ BOT_LIFETIME_SECONDS: int = int(os.environ.get("BOT_LIFETIME_SECONDS", "1200"))
 MAX_PER_USER_TASKS = 3
 SEARCH_RESULT_TTL = 30 * 60  # 搜尋結果保留 30 分鐘
 BOOK_INFO_TTL = 30 * 60
+HOT_BATCH_TTL = 30 * 60
+PAGE_SIZE = 20
 
 DEFAULT_SOURCE = "小說狂人"  # 台灣站、直連穩定，作為預設
 
-# 來源選單（顯示順序；name 需與 crawler.name 對應，或等於 ALL_SOURCES）
+# 來源選單：2026-04 搶救版只保留實測可用的 2 站 + 全部（全部＝兩站並行）
 SOURCE_MENU: list[str] = [
-    "小說狂人",     # czbooks（台灣，最穩）
-    "知軒藏書",     # zxcs 預打包 txt
-    "筆趣閣",       # biquge 多鏡像
+    "小說狂人",     # czbooks
     "番茄小說",     # fanqie API
-    "69書吧",       # 69shuba
-    "飄天文學",
-    "UU看書",
-    "新笔趣阁",
-    "23小時",
     ALL_SOURCES,
 ]
 
@@ -91,13 +86,28 @@ def _help_text() -> str:
         "• 傳送書名關鍵字 → 搜尋目前指定來源\n"
         "• `/source` → 切換搜尋來源（預設：小說狂人）\n"
         "• 點擊搜尋結果按鈕 → 查看介紹與封面\n"
-        "• `/hot` 或 `hot` → 綜合熱門 Top 20\n"
+        "• `/hot` 或 `hot` → 綜合熱門榜\n"
         "• `/hot 玄幻` → 指定分類熱門榜\n"
         "• `/tasks` → 查看下載任務\n"
         "• `/cancel` → 清除本輪搜尋結果\n\n"
         f"*支援分類：*{SUPPORTED_CATEGORIES}\n"
-        "*支援站台：*知軒藏書、筆趣閣系列、番茄小說、69書吧、飄天、UU看書、新笔趣阁、小說狂人、23小時"
+        "*支援站台：*小說狂人、番茄小說"
     )
+
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    """頂層動作選單：5 顆常用 button。"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔍 搜尋書名", callback_data="act:search"),
+            InlineKeyboardButton("🔥 熱門榜", callback_data="act:hot"),
+        ],
+        [
+            InlineKeyboardButton("📡 切換來源", callback_data="act:source"),
+            InlineKeyboardButton("📥 我的下載", callback_data="act:tasks"),
+        ],
+        [InlineKeyboardButton("❓ 說明", callback_data="act:help")],
+    ])
 
 
 def _get_source(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -193,7 +203,11 @@ def _get_book_info(context: ContextTypes.DEFAULT_TYPE, book_id: str) -> Optional
 
 def _gc_user_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = time.time()
-    for key, ttl in (("search_batches", SEARCH_RESULT_TTL), ("books", BOOK_INFO_TTL)):
+    for key, ttl in (
+        ("search_batches", SEARCH_RESULT_TTL),
+        ("books", BOOK_INFO_TTL),
+        ("hot_batches", HOT_BATCH_TTL),
+    ):
         store = context.user_data.get(key, {})
         stale = [k for k, v in store.items() if now - v["ts"] > ttl]
         for k in stale:
@@ -211,14 +225,46 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = _get_source(context)
     text = (
         f"{_help_text()}\n\n"
-        f"📡 *目前搜尋來源：{current}*\n"
-        f"點下方按鈕可切換："
+        f"📡 *目前搜尋來源：{current}*"
     )
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_source_keyboard(current),
+        reply_markup=_main_menu_keyboard(),
     )
+
+
+async def cb_act(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """頂層選單（act:xxx）callback。"""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, action = query.data.split(":", 1)
+    except Exception:
+        return
+
+    if action == "search":
+        await query.message.reply_text(
+            "🔍 *請直接輸入書名關鍵字*\n\n（任何非指令的文字訊息都會觸發搜尋）",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif action == "hot":
+        await _do_hot_for_message(query.message, category=None, context=context)
+    elif action == "source":
+        current = _get_source(context)
+        await query.message.reply_text(
+            f"📡 *目前搜尋來源：{current}*\n\n選一個站台：",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_source_keyboard(current),
+        )
+    elif action == "tasks":
+        await _render_tasks(query.message, context)
+    elif action == "help":
+        await query.message.reply_text(
+            _help_text(),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_main_menu_keyboard(),
+        )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,39 +304,77 @@ async def cb_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_hot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category = " ".join(context.args).strip() if context.args else None
-    await _do_hot(update, category)
+    await _do_hot_for_message(update.message, category, context)
 
 
 async def msg_hot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     parts = text.split(None, 1)
     category = parts[1].strip() if len(parts) > 1 else None
-    await _do_hot(update, category)
+    await _do_hot_for_message(update.message, category, context)
 
 
-async def _do_hot(update: Update, category: Optional[str]):
+async def _do_hot_for_message(
+    message,
+    category: Optional[str],
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+):
     cat_display = category if category else "綜合"
-    await update.message.reply_text(f"⏳ 正在獲取「{cat_display}」熱門榜，請稍候...")
+    await message.reply_text(f"⏳ 正在獲取「{cat_display}」熱門榜，請稍候...")
     try:
         novels = await asyncio.wait_for(
             asyncio.to_thread(get_hot_list, category),
             timeout=45.0,
         )
     except asyncio.TimeoutError:
-        await update.message.reply_text("❌ 所有站台均無回應（已等待 45 秒），請稍後再試。")
+        await message.reply_text("❌ 所有站台均無回應（已等待 45 秒），請稍後再試。")
         return
     except Exception as exc:
         logger.exception("Hot list error")
-        await update.message.reply_text(f"❌ 獲取失敗：{str(exc)[:300]}")
+        await message.reply_text(f"❌ 獲取失敗：{str(exc)[:300]}")
         return
     if not novels:
-        await update.message.reply_text("❌ 暫時無法獲取榜單，請稍後再試。")
+        await message.reply_text("❌ 暫時無法獲取榜單，請稍後再試。")
         return
 
-    lines = [f"🔥 *{cat_display}熱門排行 Top {len(novels)}*\n"]
-    for n in novels:
-        lines.append(f"`{n['rank']:2}.` {n['title']}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    # 把這批熱門結果存 context 以便按鈕回呼時查回 title
+    batch_id = ""
+    if context is not None:
+        batch_id = _put_hot_results(context, novels)
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for idx, n in enumerate(novels[:20]):
+        label = f"{n['rank']:>2}. {n['title']}"
+        if len(label.encode("utf-8")) > 60:
+            label = label[:28] + "…"
+        cb_data = f"hotb:{batch_id}:{idx}" if batch_id else f"hot1:{n['title'][:30]}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+    await message.reply_text(
+        f"🔥 *{cat_display}熱門排行 Top {len(novels)}*\n\n點選書名即可搜尋：",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+def _put_hot_results(context: ContextTypes.DEFAULT_TYPE, novels: list[dict]) -> str:
+    batch_id = secrets.token_urlsafe(6)
+    context.user_data.setdefault("hot_batches", {})[batch_id] = {
+        "novels": novels,
+        "ts": time.time(),
+    }
+    _gc_user_cache(context)
+    return batch_id
+
+
+def _get_hot_title(context: ContextTypes.DEFAULT_TYPE, batch_id: str, idx: int) -> Optional[str]:
+    batch = context.user_data.get("hot_batches", {}).get(batch_id)
+    if not batch:
+        return None
+    novels = batch["novels"]
+    if 0 <= idx < len(novels):
+        return novels[idx].get("title")
+    return None
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,24 +384,66 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _render_tasks(update.message, context)
+
+
+async def _render_tasks(message, context: ContextTypes.DEFAULT_TYPE):
     tasks = _get_tasks(context)
     if not tasks:
-        await update.message.reply_text("📭 尚無任何下載任務。")
+        await message.reply_text("📭 尚無任何下載任務。")
         return
 
+    ordered = sorted(tasks.items(), key=lambda kv: kv[1].started_at, reverse=True)[:20]
     lines = ["🗂 *下載任務*"]
-    for tid, info in sorted(tasks.items(), key=lambda kv: kv[1].started_at, reverse=True)[:20]:
-        icon = {
-            "queued": "⏳", "running": "⬇️", "done": "✅",
-            "failed": "❌", "canceled": "🚫",
-        }.get(info.status, "•")
+    keyboard: list[list[InlineKeyboardButton]] = []
+    icons = {
+        "queued": "⏳", "running": "⬇️", "done": "✅",
+        "failed": "❌", "canceled": "🚫",
+    }
+    for tid, info in ordered:
+        icon = icons.get(info.status, "•")
         prog = f"{info.progress}/{info.total}" if info.total else "-"
         line = f"{icon} `{tid}` 《{info.title}》 [{info.source}] `{info.status}` {prog}"
         if info.error:
             line += f"\n    錯誤：{info.error[:100]}"
         lines.append(line)
-    lines.append("\n取消任務：`/cancel_task 任務ID`")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        if info.status in ("queued", "running"):
+            label = f"🚫 取消 {tid} 《{info.title[:12]}》"
+            if len(label.encode("utf-8")) > 60:
+                label = f"🚫 取消 {tid}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"ct:{tid}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+    )
+
+
+async def cb_cancel_task_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _, tid = query.data.split(":", 1)
+    except Exception:
+        await query.answer("無效選項", show_alert=False)
+        return
+    tasks = _get_tasks(context)
+    info = tasks.get(tid)
+    if not info:
+        await query.answer("任務不存在", show_alert=True)
+        return
+    if info.task and not info.task.done():
+        info.task.cancel()
+        info.status = "canceled"
+        info.finished_at = time.time()
+        await query.answer(f"已取消 {tid}")
+        await query.message.reply_text(
+            f"🚫 已取消任務 `{tid}`《{info.title}》",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await query.answer("任務已結束", show_alert=False)
 
 
 async def cmd_cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -348,11 +474,14 @@ async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not keyword:
         await update.message.reply_text("請輸入書名關鍵字。")
         return
+    await _run_search(update.message, context, keyword)
 
+
+async def _run_search(message, context: ContextTypes.DEFAULT_TYPE, keyword: str):
     source = _get_source(context)
     is_all = source == ALL_SOURCES
     search_timeout = 25.0 if is_all else 20.0
-    await update.message.reply_text(
+    await message.reply_text(
         f"🔍 搜尋「{keyword}」中…（來源：{source}，/source 可切換）"
     )
 
@@ -361,40 +490,107 @@ async def msg_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             search_all(keyword, source=source), timeout=search_timeout,
         )
     except asyncio.TimeoutError:
-        await update.message.reply_text(
+        await message.reply_text(
             f"❌ {source} 無回應（已等待 {int(search_timeout)} 秒）。可試 /source 切換其他站。"
         )
         return
     except Exception as exc:
         logger.exception("search_all error")
-        await update.message.reply_text(f"❌ 搜尋失敗：{str(exc)[:300]}")
+        await message.reply_text(f"❌ 搜尋失敗：{str(exc)[:300]}")
         return
 
     if not results:
-        await update.message.reply_text(
+        await message.reply_text(
             f"❌ 「{source}」找不到《{keyword}》。可試 /source 切換其他站。"
         )
         return
 
     batch_id = _put_search_results(context, results)
+    await _send_search_page(message, context, batch_id, page=0)
 
-    keyboard = []
-    for idx, r in enumerate(results[:20]):
+
+async def _send_search_page(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    batch_id: str,
+    page: int,
+):
+    batch = context.user_data.get("search_batches", {}).get(batch_id)
+    if not batch:
+        await message.reply_text("❌ 搜尋結果已過期，請重新搜尋。")
+        return
+    results: list[SearchResult] = batch["results"]
+    total = len(results)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    source = _get_source(context)
+    is_all = source == ALL_SOURCES
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for idx in range(start, end):
+        r = results[idx]
         label = f"📖 《{r.title}》"
         if r.author and r.author != "未知":
             label += f" — {r.author}"
-        if is_all:
+        if is_all and r.source:
             label += f"  [{r.source}]"
-        # Telegram 按鈕文字上限 64 bytes
         if len(label.encode("utf-8")) > 60:
             label = label[:28] + "…"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"b:{batch_id}:{idx}")])
 
-    await update.message.reply_text(
-        f"📖 *搜尋結果（{len(results)} 本，來源：{source}）* — 點按查看介紹",
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ 上一頁", callback_data=f"p:{batch_id}:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("下一頁 ➡️", callback_data=f"p:{batch_id}:{page+1}"))
+    if nav:
+        keyboard.append(nav)
+
+    await message.reply_text(
+        f"📖 *搜尋結果（{total} 本，來源：{source}，{start+1}–{end} / {total}）* — 點按查看介紹",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def cb_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, batch_id, page_s = query.data.split(":", 2)
+        page = int(page_s)
+    except Exception:
+        return
+    await _send_search_page(query.message, context, batch_id, page)
+
+
+async def cb_hotbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        prefix, rest = query.data.split(":", 1)
+    except Exception:
+        return
+    if prefix == "hotb":
+        try:
+            batch_id, idx_s = rest.split(":", 1)
+            idx = int(idx_s)
+        except Exception:
+            await query.message.reply_text("❌ 無效的熱門書選項")
+            return
+        title = _get_hot_title(context, batch_id, idx)
+        if not title:
+            await query.message.reply_text("❌ 熱門榜資料已過期，請重新輸入 /hot")
+            return
+    elif prefix == "hot1":
+        # 短 fallback：直接用 callback_data 中的 title
+        title = rest
+    else:
+        return
+    await _run_search(query.message, context, title)
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +840,10 @@ def build_app():
     app.add_handler(CallbackQueryHandler(cb_book, pattern=r"^b:"))
     app.add_handler(CallbackQueryHandler(cb_download, pattern=r"^d:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_card, pattern=r"^x$"))
+    app.add_handler(CallbackQueryHandler(cb_act, pattern=r"^act:"))
+    app.add_handler(CallbackQueryHandler(cb_hotbook, pattern=r"^hot(b|1):"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_task_btn, pattern=r"^ct:"))
+    app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^p:"))
     return app
 
 
