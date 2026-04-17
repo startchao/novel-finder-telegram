@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 # through the proxy instead of directly. Falls back to direct if not set.
 PROXY_BASE: str = os.environ.get("PROXY_BASE", "").rstrip("/")
 
-# 這些 domain 不走 proxy（台灣站直連比 proxy 快且穩）
-NO_PROXY_HOSTS: tuple[str, ...] = ("czbooks.net",)
+# 這些 domain 不走 proxy（某些站直連反而穩）
+# 注：czbooks.net 2026 起啟用 Cloudflare 反爬，直連常 403，改走 CF Worker proxy。
+NO_PROXY_HOSTS: tuple[str, ...] = ()
 
 
 def _should_bypass_proxy(url: str) -> bool:
@@ -79,6 +80,8 @@ class SiteConfig:
     chapter_list_sels: list[str]   # 章節列表 a 選擇器
     content_sels: list[str]        # 章節內文容器選擇器
     encoding: str = "utf-8"
+    # 可選：path 型搜尋（像 czbooks 的 /s/{q}/1）。如非空則取代 search_path+search_param。
+    search_url_tpl: str = ""
     # 書籍詳情頁選擇器（description/author/cover/status）
     detail_title_sels: list[str] = field(default_factory=lambda: [
         "h1", ".booktitle", ".book-title", "#bookinfo h1", ".book-info h1", "meta[property='og:title']",
@@ -179,20 +182,23 @@ SITE_XBIQUGE = SiteConfig(
 SITE_CZBOOKS = SiteConfig(
     name="小說狂人",
     base_url="https://czbooks.net",
-    hot_paths=["/rank/", "/ranking/", "/top/", "/"],
-    hot_cat_tpl="/rank/{cat}/",
-    category_map={"玄幻": "xuanhuan", "仙俠": "xianxia", "都市": "dushi", "穿越": "chuanyue"},
-    hot_item_sels=[".rank-list li", ".novel-list li", "ul.list li", "ol li"],
-    search_path="/search",
+    # czbooks 首頁即有最新/推薦書，沒有獨立 /top 頁
+    hot_paths=["/"],
+    hot_cat_tpl="/",   # 無獨立分類榜
+    category_map={},
+    hot_item_sels=["li.novel-item-wrapper", "div.novel-item-wrapper"],
+    # 實際搜尋格式（by watermelon1024/czbooks-helper）：/s/<keyword>/<page>
+    search_path="/s",  # 保留以相容舊流程
     search_method="GET",
-    search_param="q",
-    search_item_sels=[".novel-list li", ".search-result li", "ul.list li"],
-    search_title_sels=[".title a", "h3 a", "h2 a", ".bookname a", "a"],
-    search_author_sels=[".author", ".writer", "span.author"],
-    search_latest_sels=[".last-chapter a", ".update a", ".newchapter a"],
-    chapter_list_sels=["#chapters-list a", "#chapter-list a", ".chapter-list a", "#list a", "ul.list a"],
-    content_sels=["#novel-content", ".chapter-content", "#content", ".content"],
+    search_param="",
+    search_item_sels=["li.novel-item-wrapper", "div.novel-item-wrapper"],
+    search_title_sels=["a[href*='/n/']"],
+    search_author_sels=[".novel-item-author", ".author"],
+    search_latest_sels=[".novel-item-latest-chapter", ".last-chapter a"],
+    chapter_list_sels=["ul.nav.chapter-list li a", ".chapter-list a", "#chapter-list a", "ul.list a"],
+    content_sels=[".content", "#content", ".chapter-content"],
     encoding="utf-8",
+    search_url_tpl="/s/{q}/1",
 )
 
 SITE_23US = SiteConfig(
@@ -262,7 +268,10 @@ def _extract_title(item, link) -> str:
     for cand in candidates:
         if cand and cand not in _STATUS_WORDS and cand not in _NAV_TITLES and len(cand) >= 2:
             return cand
-    for sel in (".bookname", ".title", "h3", "h4", "dt", "h2"):
+    for sel in (
+        ".novel-item-title", ".novel-title", ".bookname", ".title",
+        "h3", "h4", "dt", "h2",
+    ):
         el = item.select_one(sel)
         if not el:
             continue
@@ -584,6 +593,16 @@ def _search_from_site(site: SiteConfig, keyword: str) -> list[dict]:
     scraper = make_session()
     base = _warm_up(scraper, site)
     scraper.headers["Referer"] = base + "/"
+
+    # Path 型搜尋（如 czbooks 的 /s/<keyword>/1）
+    if site.search_url_tpl:
+        path = site.search_url_tpl.replace("{q}", urllib.parse.quote(keyword, safe=""))
+        url = base + path
+        resp = _fetch(scraper, url)
+        html = _decode(resp)
+        soup = BeautifulSoup(html, "lxml")
+        return _parse_search(soup, site, base)
+
     search_url = base + site.search_path
 
     try:
