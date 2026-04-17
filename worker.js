@@ -5,6 +5,7 @@
 //   Optional params: method=POST, body=URLENCODED_FORM_DATA, referer=URL, cookie=VALUE
 
 const ALLOWED_DOMAINS = [
+  // 既有 6 站（scraper.py SITES）
   "69shuba.cx",
   "69shuba.com",
   "ptwxz.com",
@@ -14,6 +15,19 @@ const ALLOWED_DOMAINS = [
   "xbiquge.bid",
   "czbooks.net",
   "23us.so",
+  // 知軒藏書
+  "zxcs.me",
+  "zxcs.info",
+  "zxcs8.com",
+  "zxcs.com",
+  // 筆趣閣系列多鏡像
+  "biqu5200.net",
+  "biquge.info",
+  "biqudu.net",
+  "biqugebar.net",
+  // 番茄小說（網頁 + API）
+  "fanqienovel.com",
+  "fqnovel.com",
 ];
 
 function isAllowed(url) {

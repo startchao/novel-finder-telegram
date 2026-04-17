@@ -70,12 +70,12 @@ class FanqieCrawler(BaseCrawler):
 
     def _api_get(self, path: str, params: dict) -> dict:
         from scraper import _fetch
+        import urllib.parse
 
         session = self._get_session()
-        # 直接用 requests 介面；番茄 API 不走 Cloudflare
-        url = _API_BASE + path
-        resp = session.get(url, params=_default_params(params), timeout=10)
-        resp.raise_for_status()
+        qs = urllib.parse.urlencode(_default_params(params))
+        url = f"{_API_BASE}{path}?{qs}"
+        resp = _fetch(session, url, max_retries=2)
         return resp.json()
 
     # ---- search ----------------------------------------------------------
@@ -83,20 +83,17 @@ class FanqieCrawler(BaseCrawler):
     def search(self, keyword: str) -> list[SearchResult]:
         """用網頁搜尋頁擷取 book_id，比 API 穩。"""
         from scraper import _fetch, _decode
+        import urllib.parse
 
         session = self._get_session()
         try:
-            resp = session.get(
-                f"{_WEB_BASE}/search",
-                params={"query": keyword},
-                timeout=10,
-            )
-            resp.raise_for_status()
+            qs = urllib.parse.urlencode({"query": keyword})
+            resp = _fetch(session, f"{_WEB_BASE}/search?{qs}", max_retries=1)
         except Exception as exc:
             logger.warning("[fanqie] search request failed: %s", exc)
             return []
 
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(_decode(resp), "lxml")
         results: list[SearchResult] = []
         # 番茄搜尋結果卡片 a[href^="/page/"] 或 a[href^="/book/"]
         seen: set[str] = set()
